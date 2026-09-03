@@ -62,6 +62,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         EditorGUILayout.HelpBox(
             "按原始 Sprite/Texture 聚合列出 Image 和 RawImage 引用。配置替换 Sprite 后，将生成同目录下的 *_Replaced.prefab。",
             MessageType.Info);
+        EditorGUILayout.LabelField("提示：点击原图或槽位图缩略图可在 Project 窗口中定位资源。", EditorStyles.miniLabel);
 
         EditorGUI.BeginChangeCheck();
         var selectedPrefab = (GameObject)EditorGUILayout.ObjectField(
@@ -165,7 +166,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         {
             using (new EditorGUILayout.HorizontalScope())
             {
-                DrawPreview(slot.Source);
+                DrawPreview(slot.Source, "点击定位原图资源");
                 using (new EditorGUILayout.VerticalScope())
                 {
                     EditorGUILayout.LabelField(slot.SourcePath, EditorStyles.miniLabel);
@@ -185,7 +186,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 }
                 if (replacement != null)
                 {
-                    DrawPreview(replacement);
+                    DrawPreview(replacement, "点击定位槽位图资源");
                 }
             }
 
@@ -217,17 +218,116 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         }
     }
 
-    private static void DrawPreview(UnityEngine.Object source)
+    private void DrawPreview(UnityEngine.Object source, string tooltip)
     {
-        var preview = source == null ? null : AssetPreview.GetAssetPreview(source);
-        if (preview != null)
+        var previewRect = GUILayoutUtility.GetRect(
+            PreviewSize,
+            PreviewSize,
+            GUILayout.Width(PreviewSize),
+            GUILayout.Height(PreviewSize));
+        EditorGUI.DrawRect(previewRect, new Color(0.16f, 0.16f, 0.16f));
+
+        var sprite = source as Sprite;
+        if (sprite != null && sprite.texture != null
+            && sprite.texture.width > 0 && sprite.texture.height > 0)
         {
-            GUILayout.Label(preview, GUILayout.Width(PreviewSize), GUILayout.Height(PreviewSize));
+            var texture = sprite.texture;
+            var uv = GetSpriteUvRect(sprite, texture);
+            var fittedRect = GetAspectFittedRect(previewRect, sprite.rect.width / sprite.rect.height);
+            GUI.DrawTextureWithTexCoords(fittedRect, texture, uv, true);
         }
-        else
+        else if (source is Texture && ((Texture)source).width > 0 && ((Texture)source).height > 0)
         {
-            GUILayout.Box(GUIContent.none, GUILayout.Width(PreviewSize), GUILayout.Height(PreviewSize));
+            var texture = (Texture)source;
+            var fittedRect = GetAspectFittedRect(previewRect, (float)texture.width / texture.height);
+            EditorGUI.DrawPreviewTexture(fittedRect, texture, null, ScaleMode.ScaleToFit);
         }
+        else if (source != null)
+        {
+            var preview = AssetPreview.GetAssetPreview(source);
+            if (preview != null)
+            {
+                EditorGUI.DrawPreviewTexture(previewRect, preview, null, ScaleMode.ScaleToFit);
+            }
+        }
+
+        if (source != null && GUI.Button(previewRect, new GUIContent(string.Empty, tooltip), GUIStyle.none))
+        {
+            EditorUtility.FocusProjectWindow();
+            Selection.activeObject = source;
+            EditorGUIUtility.PingObject(source);
+        }
+    }
+
+    private static Rect GetSpriteUvRect(Sprite sprite, Texture texture)
+    {
+        if (!sprite.packed)
+        {
+            return new Rect(
+                sprite.rect.x / texture.width,
+                sprite.rect.y / texture.height,
+                sprite.rect.width / texture.width,
+                sprite.rect.height / texture.height);
+        }
+
+        // Packed and tightly packed Sprites can throw when textureRect is read.
+        // UV bounds always identify the actual region inside the atlas texture.
+        var uvs = sprite.uv;
+        if (uvs == null || uvs.Length == 0)
+        {
+            return new Rect(0f, 0f, 1f, 1f);
+        }
+
+        var minX = uvs[0].x;
+        var maxX = uvs[0].x;
+        var minY = uvs[0].y;
+        var maxY = uvs[0].y;
+        for (var index = 1; index < uvs.Length; index++)
+        {
+            minX = Mathf.Min(minX, uvs[index].x);
+            maxX = Mathf.Max(maxX, uvs[index].x);
+            minY = Mathf.Min(minY, uvs[index].y);
+            maxY = Mathf.Max(maxY, uvs[index].y);
+        }
+
+        var uv = Rect.MinMaxRect(minX, minY, maxX, maxY);
+        switch (sprite.packingRotation)
+        {
+            case SpritePackingRotation.FlipHorizontal:
+                uv.x += uv.width;
+                uv.width = -uv.width;
+                break;
+            case SpritePackingRotation.FlipVertical:
+                uv.y += uv.height;
+                uv.height = -uv.height;
+                break;
+            case SpritePackingRotation.Rotate180:
+                uv.x += uv.width;
+                uv.y += uv.height;
+                uv.width = -uv.width;
+                uv.height = -uv.height;
+                break;
+        }
+
+        return uv;
+    }
+
+    private static Rect GetAspectFittedRect(Rect container, float aspect)
+    {
+        if (aspect <= 0f || float.IsNaN(aspect) || float.IsInfinity(aspect))
+        {
+            return container;
+        }
+
+        var containerAspect = container.width / container.height;
+        if (aspect > containerAspect)
+        {
+            var height = container.width / aspect;
+            return new Rect(container.x, container.y + (container.height - height) * 0.5f, container.width, height);
+        }
+
+        var width = container.height * aspect;
+        return new Rect(container.x + (container.width - width) * 0.5f, container.y, width, container.height);
     }
 
     private bool MatchesSearch(ImageSlot slot)
