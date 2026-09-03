@@ -1,0 +1,6 @@
+Prefab: D:\Project\UnityProject\Lz\Assets\Main\Prefabs\UI\UIVolcano\UIVolcanoMain.prefab
+Copied: 178
+Converted TMP: 283
+Removed scripts: 356
+Missing GUID: 1306
+Conflicts: 0

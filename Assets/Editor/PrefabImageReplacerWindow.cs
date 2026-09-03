@@ -19,10 +19,12 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
     private GameObject prefab;
     private string searchText = string.Empty;
     private Vector2 scrollPosition;
+    private Vector2 problemScrollPosition;
     private List<ImageSlot> slots = new List<ImageSlot>();
     private List<ScanProblem> scanProblems = new List<ScanProblem>();
     private Hash128 scannedDependencyHash;
     private int lastReviewIssueCount;
+    private bool problemDetailsExpanded;
     private bool hasScanned;
     private bool isBusy;
 
@@ -104,11 +106,13 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         var outputPath = GetNextOutputPath(prefabPath);
         EditorGUILayout.LabelField("输出", outputPath, EditorStyles.miniLabel);
 
-        if (scanProblems.Count > 0)
+        var currentIssues = BuildReviewIssues();
+        if (currentIssues.Count > 0)
         {
             EditorGUILayout.HelpBox(
-                string.Format("发现 {0} 个问题项。执行时需要逐项确认，问题引用会被跳过。", scanProblems.Count),
+                BuildIssueSummary(currentIssues) + "\n执行时需要逐项确认，问题引用会被跳过。",
                 MessageType.Warning);
+            DrawProblemDetails(currentIssues);
         }
 
         EditorGUILayout.LabelField(
@@ -168,6 +172,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                     EditorGUILayout.LabelField(
                         slot.SourceKind == SourceKind.Sprite ? "Image.sprite" : "RawImage.texture",
                         EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField("原图分辨率", slot.OriginalResolutionText, EditorStyles.miniLabel);
                 }
 
                 GUILayout.FlexibleSpace();
@@ -181,6 +186,20 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 if (replacement != null)
                 {
                     DrawPreview(replacement);
+                }
+            }
+
+            if (slot.Replacement != null)
+            {
+                EditorGUILayout.LabelField("槽位图分辨率", slot.ReplacementResolutionText, EditorStyles.miniLabel);
+                if (slot.HasResolutionMismatch)
+                {
+                    EditorGUILayout.HelpBox(
+                        string.Format(
+                            "分辨率不一致：原图 {0}，槽位图 {1}。请确认缩放、裁剪和显示效果符合预期。",
+                            slot.OriginalResolutionText,
+                            slot.ReplacementResolutionText),
+                        MessageType.Warning);
                 }
             }
 
@@ -253,6 +272,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 if (image.sprite == null)
                 {
                     scanProblems.Add(new ScanProblem(
+                        IssueKind.ImageMissingReference,
                         BuildTransformPath(image.transform, root.transform),
                         "Image.sprite 为空或丢失引用"));
                     continue;
@@ -267,6 +287,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 if (rawImage.texture == null)
                 {
                     scanProblems.Add(new ScanProblem(
+                        IssueKind.RawImageMissingReference,
                         BuildTransformPath(rawImage.transform, root.transform),
                         "RawImage.texture 为空或丢失引用"));
                     continue;
@@ -283,7 +304,10 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         }
         catch (Exception exception)
         {
-            scanProblems.Add(new ScanProblem(path, "扫描失败：" + exception.Message));
+            scanProblems.Add(new ScanProblem(
+                IssueKind.ScanFailure,
+                path,
+                "扫描失败：" + exception.Message));
             Debug.LogException(exception);
         }
         finally
@@ -328,27 +352,7 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
             return;
         }
 
-        var issues = new List<ReviewIssue>();
-        foreach (var problem in scanProblems)
-        {
-            issues.Add(new ReviewIssue(problem.Path, problem.Message));
-        }
-
-        foreach (var slot in slots)
-        {
-            if (slot.Replacement == null)
-            {
-                issues.Add(new ReviewIssue(slot.DisplayName, "未配置替换 Sprite（该槽位将跳过）"));
-            }
-
-            foreach (var usage in slot.Usages.Where(u => !u.Writable))
-            {
-                issues.Add(new ReviewIssue(
-                    usage.Path,
-                    usage.ComponentProperty + " 位于嵌套 Prefab，无法直接写回（该引用将跳过）"));
-            }
-        }
-
+        var issues = BuildReviewIssues();
         lastReviewIssueCount = issues.Count;
 
         if (issues.Count > 0)
@@ -364,6 +368,112 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         else
         {
             PerformApply();
+        }
+    }
+
+    private List<ReviewIssue> BuildReviewIssues()
+    {
+        var issues = new List<ReviewIssue>();
+        foreach (var problem in scanProblems)
+        {
+            issues.Add(new ReviewIssue(problem.Kind, problem.Path, problem.Message));
+        }
+
+        foreach (var slot in slots)
+        {
+            if (slot.Replacement == null)
+            {
+                issues.Add(new ReviewIssue(
+                    IssueKind.MissingReplacement,
+                    slot.DisplayName,
+                    "未配置替换 Sprite（该槽位将跳过）"));
+            }
+            else if (slot.HasResolutionMismatch)
+            {
+                issues.Add(new ReviewIssue(
+                    IssueKind.ResolutionMismatch,
+                    slot.DisplayName,
+                    string.Format(
+                        "原图分辨率 {0}，槽位图分辨率 {1}（分辨率不一致，请确认后继续）",
+                        slot.OriginalResolutionText,
+                        slot.ReplacementResolutionText)));
+            }
+
+            foreach (var usage in slot.Usages.Where(u => !u.Writable))
+            {
+                issues.Add(new ReviewIssue(
+                    IssueKind.NestedPrefabReadOnly,
+                    usage.Path,
+                    usage.ComponentProperty + " 位于嵌套 Prefab，无法直接写回（该引用将跳过）"));
+            }
+        }
+
+        return issues;
+    }
+
+    private void DrawProblemDetails(List<ReviewIssue> issues)
+    {
+        problemDetailsExpanded = EditorGUILayout.Foldout(
+            problemDetailsExpanded,
+            string.Format("问题明细（{0}）", issues.Count),
+            true);
+        if (!problemDetailsExpanded)
+        {
+            return;
+        }
+
+        var height = Mathf.Min(220f, Mathf.Max(64f, issues.Count * 34f));
+        problemScrollPosition = EditorGUILayout.BeginScrollView(
+            problemScrollPosition,
+            EditorStyles.helpBox,
+            GUILayout.Height(height));
+        foreach (var issue in issues)
+        {
+            EditorGUILayout.LabelField(
+                string.Format("[{0}] {1}\n{2}", GetIssueKindLabel(issue.Kind), issue.Path, issue.Message),
+                EditorStyles.wordWrappedMiniLabel);
+            GUILayout.Space(4f);
+        }
+
+        EditorGUILayout.EndScrollView();
+    }
+
+    private static string BuildIssueSummary(List<ReviewIssue> issues)
+    {
+        return string.Format(
+            "当前共 {0} 个问题项：Image 空/丢失 {1}，RawImage 空/丢失 {2}，未配置槽位 {3}，分辨率不一致 {4}，嵌套只读引用 {5}，扫描失败 {6}。",
+            issues.Count,
+            CountIssues(issues, IssueKind.ImageMissingReference),
+            CountIssues(issues, IssueKind.RawImageMissingReference),
+            CountIssues(issues, IssueKind.MissingReplacement),
+            CountIssues(issues, IssueKind.ResolutionMismatch),
+            CountIssues(issues, IssueKind.NestedPrefabReadOnly),
+            CountIssues(issues, IssueKind.ScanFailure));
+    }
+
+    private static int CountIssues(List<ReviewIssue> issues, IssueKind kind)
+    {
+        return issues.Count(issue => issue.Kind == kind);
+    }
+
+    private static string GetIssueKindLabel(IssueKind kind)
+    {
+        switch (kind)
+        {
+            case IssueKind.ImageMissingReference:
+                return "Image 空/丢失";
+            case IssueKind.RawImageMissingReference:
+                return "RawImage 空/丢失";
+            case IssueKind.MissingReplacement:
+                return "未配置槽位";
+            case IssueKind.ResolutionMismatch:
+                return "分辨率不一致";
+            case IssueKind.NestedPrefabReadOnly:
+                return "嵌套只读";
+            case IssueKind.ScanFailure:
+                return "扫描失败";
+            default:
+                return "其它";
         }
     }
 
@@ -630,6 +740,16 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         Texture
     }
 
+    private enum IssueKind
+    {
+        ImageMissingReference,
+        RawImageMissingReference,
+        MissingReplacement,
+        ResolutionMismatch,
+        NestedPrefabReadOnly,
+        ScanFailure
+    }
+
     private sealed class ImageSlot
     {
         public readonly string Key;
@@ -656,6 +776,77 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
                 return string.IsNullOrEmpty(path) ? "（非项目资源）" : path;
             }
         }
+
+        public string OriginalResolutionText
+        {
+            get { return FormatResolution(GetResolution(Source, SourceKind == SourceKind.Sprite)); }
+        }
+
+        public string ReplacementResolutionText
+        {
+            get
+            {
+                if (Replacement == null)
+                {
+                    return "未配置";
+                }
+
+                return FormatResolution(GetResolution(Replacement, SourceKind == SourceKind.Sprite));
+            }
+        }
+
+        public bool HasResolutionMismatch
+        {
+            get
+            {
+                if (Replacement == null)
+                {
+                    return false;
+                }
+
+                return GetResolution(Source, SourceKind == SourceKind.Sprite) != GetResolution(
+                    Replacement,
+                    SourceKind == SourceKind.Sprite);
+            }
+        }
+
+        private static Vector2Int GetResolution(UnityEngine.Object source, bool useSpriteRegion)
+        {
+            if (source == null)
+            {
+                return Vector2Int.zero;
+            }
+
+            if (useSpriteRegion)
+            {
+                var sprite = source as Sprite;
+                if (sprite != null)
+                {
+                    return new Vector2Int(
+                        Mathf.RoundToInt(sprite.rect.width),
+                        Mathf.RoundToInt(sprite.rect.height));
+                }
+            }
+
+            var sourceSprite = source as Sprite;
+            if (sourceSprite != null)
+            {
+                var spriteTexture = sourceSprite.texture;
+                return spriteTexture == null
+                    ? Vector2Int.zero
+                    : new Vector2Int(spriteTexture.width, spriteTexture.height);
+            }
+
+            var texture = source as Texture;
+            return texture == null ? Vector2Int.zero : new Vector2Int(texture.width, texture.height);
+        }
+
+        private static string FormatResolution(Vector2Int resolution)
+        {
+            return resolution == Vector2Int.zero
+                ? "未知"
+                : string.Format("{0} x {1}", resolution.x, resolution.y);
+        }
     }
 
     private sealed class ImageUsage
@@ -674,11 +865,13 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
     private sealed class ScanProblem
     {
+        public readonly IssueKind Kind;
         public readonly string Path;
         public readonly string Message;
 
-        public ScanProblem(string path, string message)
+        public ScanProblem(IssueKind kind, string path, string message)
         {
+            Kind = kind;
             Path = path;
             Message = message;
         }
@@ -686,12 +879,14 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
 
     private sealed class ReviewIssue
     {
+        public readonly IssueKind Kind;
         public readonly string Path;
         public readonly string Message;
         public bool Acknowledged;
 
-        public ReviewIssue(string path, string message)
+        public ReviewIssue(IssueKind kind, string path, string message)
         {
+            Kind = kind;
             Path = path;
             Message = message;
         }
@@ -716,13 +911,16 @@ public sealed class PrefabImageReplacerWindow : EditorWindow
         private void OnGUI()
         {
             EditorGUILayout.LabelField("执行前确认问题项", EditorStyles.boldLabel);
-            EditorGUILayout.HelpBox("勾选每一项表示已知悉并跳过该问题引用；可写入的有效槽位仍会继续替换。", MessageType.Warning);
+            EditorGUILayout.HelpBox(
+                BuildIssueSummary(issues)
+                + "\n勾选每一项表示已知悉并跳过该问题引用；可写入的有效槽位仍会继续替换。",
+                MessageType.Warning);
 
             scroll = EditorGUILayout.BeginScrollView(scroll);
             foreach (var issue in issues)
             {
                 issue.Acknowledged = EditorGUILayout.ToggleLeft(
-                    issue.Path + "：" + issue.Message,
+                    "[" + GetIssueKindLabel(issue.Kind) + "] " + issue.Path + "：" + issue.Message,
                     issue.Acknowledged,
                     GUILayout.ExpandWidth(true));
             }
