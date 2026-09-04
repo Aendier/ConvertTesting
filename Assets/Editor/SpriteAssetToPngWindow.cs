@@ -1017,8 +1017,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             }
             finally
             {
-                AssetDatabase.AllowAutoRefresh();
-                AssetDatabase.StopAssetEditing();
+                try
+                {
+                    AssetDatabase.StopAssetEditing();
+                }
+                finally
+                {
+                    AssetDatabase.AllowAutoRefresh();
+                }
                 transactionActive = false;
             }
 
@@ -1047,8 +1053,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         {
             if (transactionActive)
             {
-                try { AssetDatabase.AllowAutoRefresh(); } catch (Exception) { }
                 try { AssetDatabase.StopAssetEditing(); } catch (Exception) { }
+                try { AssetDatabase.AllowAutoRefresh(); } catch (Exception) { }
             }
             RollBack(assetPath, outputPath, backupAssetPath, backupMetaPath,
                 outputBackupPath, outputBackupMetaPath, hadOutput, hadOutputMeta, referenceEdits);
