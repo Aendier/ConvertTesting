@@ -7,25 +7,23 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEditor;
-using UnityEditor.U2D.Sprites;
 using UnityEngine;
 
 /// <summary>
-/// Converts standalone Sprite .asset files into cropped PNG Sprite assets while retaining their GUID.
+/// Converts standalone Sprite .asset files into editable PNG Sprite assets and migrates their references.
 /// </summary>
 public sealed class SpriteAssetToPngWindow : EditorWindow
 {
     private const string DefaultFolder = "Assets";
-    // Keep temporary imports in a short, stable path.  Some source folders are
-    // already close to Windows' MAX_PATH limit; putting the temporary filename
-    // next to the source would make Unity fail to create its .meta file.
-    private const string TemporaryImportFolder = "Assets/Editor/SpriteAssetToPngTemp";
     private const long SpriteLocalId = 21300000L;
     private static readonly Regex GuidLineRegex = new Regex(
         "^guid:\\s*[0-9a-fA-F]{32}\\s*$",
         RegexOptions.Multiline | RegexOptions.Compiled);
     private static readonly Regex SerializedGuidRegex = new Regex(
         "guid:\\s*([0-9a-fA-F]{32})",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex SerializedSpriteReferenceRegex = new Regex(
+        "\\{fileID:\\s*(-?[0-9]+),\\s*guid:\\s*([0-9a-fA-F]{32}),\\s*type:\\s*2\\s*\\}",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly HashSet<string> TextExtensions = new HashSet<string>(
         new[] { ".asset", ".prefab", ".unity", ".mat", ".anim", ".controller", ".overridecontroller", ".playable",
@@ -44,13 +42,19 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private readonly List<string> scanProblems = new List<string>();
     private readonly List<string> specialAssetReports = new List<string>();
     private int scannedAssetCount;
-    private int pivotNormalizationCount;
     private int layoutApproximationCount;
-    private int existingReferenceRepairCount;
     private bool hasScanned;
     private bool isBusy;
     private string[] scanPaths = new string[0];
     private int scanIndex;
+    private string[] referenceScanPaths = new string[0];
+    private int referenceScanIndex;
+    private int referenceFinalizeIndex;
+    private bool referenceScanPrepared;
+    private readonly Dictionary<string, ConversionCandidate> scanCandidatesByGuid =
+        new Dictionary<string, ConversionCandidate>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, AtlasInfo> scanAtlasesByGuid =
+        new Dictionary<string, AtlasInfo>(StringComparer.OrdinalIgnoreCase);
     private string scanFolderLabel = string.Empty;
     private ConversionRun conversionRun;
     private string progressMessage = string.Empty;
@@ -84,7 +88,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     {
         EditorGUILayout.LabelField("Sprite .asset 批量转 PNG", EditorStyles.boldLabel);
         EditorGUILayout.HelpBox(
-            "按图集区域裁切独立 PNG，保留原 GUID/fileID、Border、PPU，并将 Pivot 归一化到 0-1。序列化引用会从 type:2 迁移为 type:3；转换前自动备份。旋转项和 TMP SpriteAsset 仅报告，图集删除必须通过二次确认和引用检查。",
+            "将 Sprite .asset 变成设计师可直接编辑的单图 PNG：完整同名源图直接复用，图集切片按 Sprite Rect 导出。最终 PNG 保持自己的 GUID，Assets 下的 Unity 序列化引用会迁移到 PNG；转换前自动备份，逐项失败逐项回滚。",
             MessageType.Info);
         EditorGUI.BeginDisabledGroup(isBusy);
         DrawFolderSelection();
@@ -103,35 +107,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             var progressRect = GUILayoutUtility.GetRect(1f, 18f);
             EditorGUI.ProgressBar(progressRect, progressValue, Mathf.RoundToInt(progressValue * 100f) + "%");
         }
-        DrawScanResultReadable();
-    }
-
-    private void OnGUIOld()
-    {
-        EditorGUILayout.LabelField("Sprite .asset 批量转 PNG", EditorStyles.boldLabel);
-        EditorGUILayout.HelpBox(
-            "只处理指定目录中主对象为 Sprite、且源纹理为 PNG 的 .asset。工具会裁切独立 PNG，保留 Unity 序列化引用使用的 GUID/fileID、Border 和 PPU；有效 Pivot 保持不变，越界 Pivot 会归一化到 0～1。原文件备份在 Library 中，字符串形式的路径引用无法自动迁移。",
-            MessageType.Info);
-
-        EditorGUI.BeginDisabledGroup(isBusy);
-        DrawFolderSelection();
-
-        using (new EditorGUILayout.HorizontalScope())
-        {
-            if (GUILayout.Button("预检", GUILayout.Height(28f)))
-            {
-                Scan();
-            }
-
-            EditorGUI.BeginDisabledGroup(!hasScanned || candidates.Count == 0);
-            if (GUILayout.Button("转换全部可转换项", GUILayout.Height(28f)))
-            {
-                ConvertAll();
-            }
-            EditorGUI.EndDisabledGroup();
-        }
-        EditorGUI.EndDisabledGroup();
-
         DrawScanResultReadable();
     }
 
@@ -173,15 +148,13 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         var itemWarningCount = problemItems.Count + candidates.Sum(candidate => candidate.Warnings.Count);
         var itemNoteCount = candidates.Sum(candidate => candidate.Notes.Count);
         EditorGUILayout.LabelField(
-            string.Format("扫描 .asset：{0}    可转换 Sprite：{1}    已存在可续跑：{2}    复用 PNG：{3}    Pivot 归一化：{4}    图集组：{5}    问题：{6}    条目警告：{7}    条目说明：{8}",
-                scannedAssetCount, candidates.Count(c => !c.Blocked), candidates.Count(c => c.AlreadyConverted),
-                candidates.Count(c => c.ReuseExistingPng && !c.Blocked), pivotNormalizationCount,
+            string.Format("扫描 .asset：{0}    可转换：{1}    复用单图：{2}    图集导出：{3}    覆盖 PNG：{4}    图集组：{5}    问题：{6}    条目警告：{7}    条目说明：{8}",
+                scannedAssetCount, candidates.Count(c => !c.Blocked),
+                candidates.Count(c => c.ReuseExistingPng && !c.Blocked),
+                candidates.Count(c => !c.ReuseExistingPng && !c.OverwriteExistingPng && !c.Blocked),
+                candidates.Count(c => c.OverwriteExistingPng && !c.Blocked),
                 atlases.Count, scanProblems.Count + specialAssetReports.Count, itemWarningCount, itemNoteCount),
             EditorStyles.miniBoldLabel);
-        if (existingReferenceRepairCount > 0)
-        {
-            EditorGUILayout.HelpBox("发现 " + existingReferenceRepairCount + " 个已生成 PNG 仍有 type:2 引用，转换时会自动修复。", MessageType.Info);
-        }
         if (scanProblems.Count > 0)
         {
             EditorGUILayout.HelpBox(string.Join("\n", scanProblems.Take(10).ToArray()), MessageType.Warning);
@@ -207,8 +180,9 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 Mathf.RoundToInt(sprite.rect.width), Mathf.RoundToInt(sprite.rect.height),
                 candidate.ApproximatePivot ? "，Pivot 将归一化" : string.Empty);
             EditorGUILayout.LabelField(Path.GetFileName(candidate.AssetPath), size, EditorStyles.miniLabel);
-            var mode = candidate.ReuseExistingPng ? "（复用现有 PNG）" : string.Empty;
-            EditorGUILayout.LabelField(candidate.AssetPath + " -> " + candidate.OutputPath + mode, EditorStyles.miniLabel);
+            EditorGUILayout.LabelField(candidate.ActionLabel + "    引用：" + candidate.SerializedReferenceCount,
+                EditorStyles.miniBoldLabel);
+            EditorGUILayout.LabelField(candidate.AssetPath + " -> " + candidate.OutputPath, EditorStyles.miniLabel);
         }
         EditorGUILayout.EndScrollView();
     }
@@ -321,10 +295,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
     private static void AddConversionWarnings(ConversionCandidate candidate)
     {
-        if (candidate.ReuseExistingPng)
-        {
-            AddCandidateNote(candidate, "检测到同名 PNG 是源 Sprite 的 backing texture，将直接复用，不生成副本。转换时会迁移引用和 Sprite 几何数据。");
-        }
         if (candidate.ApproximatePivot)
         {
             AddCandidateWarning(candidate, "Pivot 超出 0~1，转换时会归一化到 0~1。");
@@ -345,85 +315,137 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
         var desired = Path.ChangeExtension(candidate.AssetPath, ".png").Replace('\\', '/');
         var desiredAbsolute = AssetPathToAbsolute(desired);
-        if (!File.Exists(desiredAbsolute)) return;
-
-        // A same-name PNG is safe to reuse only when it is the source texture of
-        // the Sprite asset.  A coincidental pixel duplicate from another atlas
-        // must not be silently merged.
-        if (!string.Equals(candidate.SourceTexturePath, desired, StringComparison.OrdinalIgnoreCase))
-        {
-            AddCandidateWarning(candidate, "发现同名 PNG，但它不是该 Sprite 的 backing texture；按规则不自动合并，将按普通转换处理。");
-            return;
-        }
-
-        string existingGuid = string.Empty;
-        var desiredMetaPath = desiredAbsolute + ".meta";
-        if (File.Exists(desiredMetaPath))
-        {
-            try { existingGuid = ReadMetaGuid(desiredMetaPath); } catch (Exception) { }
-        }
-        if (string.IsNullOrEmpty(existingGuid))
-        {
-            candidate.Blocked = true;
-            AddCandidateWarning(candidate, "同名 backing PNG 缺少有效 meta/GUID，无法安全迁移引用。");
-            return;
-        }
-
         var sourceSprite = AssetDatabase.LoadAssetAtPath<Sprite>(candidate.AssetPath);
-        var pngSprite = AssetDatabase.LoadAssetAtPath<Sprite>(desired);
-        if (sourceSprite == null || pngSprite == null)
+        if (sourceSprite == null || sourceSprite.texture == null)
         {
             candidate.Blocked = true;
-            AddCandidateWarning(candidate, "同名 backing PNG 无法作为 Sprite 导入，已阻断自动合并。");
-            return;
-        }
-
-        string pixelDifference;
-        if (!TryCompareSpritePixels(sourceSprite, desired, out pixelDifference))
-        {
-            candidate.Blocked = true;
-            AddCandidateWarning(candidate, "同名 backing PNG 像素或尺寸不一致：" + pixelDifference);
+            candidate.ActionLabel = "阻断：源纹理缺失";
+            AddCandidateWarning(candidate, "Sprite 的像素只存在于源纹理中；源纹理缺失时无法从 .asset 自身重建 PNG。");
             return;
         }
 
         candidate.OutputPath = desired;
-        candidate.ReuseExistingPng = true;
-        candidate.ExistingPngGuid = existingGuid;
-        var stringReferencePaths = FindRuntimeStringReferencePaths(candidate.Guid, candidate.AssetPath).Take(4).ToArray();
-        if (stringReferencePaths.Length > 0)
+        var hasExistingPng = File.Exists(desiredAbsolute);
+        if (hasExistingPng)
         {
-            AddCandidateWarning(candidate,
-                "发现疑似运行时字符串引用（只报告、不自动修改）：" + string.Join("、", stringReferencePaths));
+            var desiredMetaPath = desiredAbsolute + ".meta";
+            if (File.Exists(desiredMetaPath))
+            {
+                try { candidate.ExistingPngGuid = ReadMetaGuid(desiredMetaPath); } catch (Exception) { }
+            }
+            if (string.IsNullOrEmpty(candidate.ExistingPngGuid))
+            {
+                candidate.Blocked = true;
+                candidate.ActionLabel = "阻断：同名 PNG 缺少 GUID";
+                AddCandidateWarning(candidate, "同名 PNG 缺少有效 meta/GUID，无法在保留其身份的前提下迁移引用。");
+                return;
+            }
+        }
+
+        var sourceIsDesired = string.Equals(candidate.SourceTexturePath, desired, StringComparison.OrdinalIgnoreCase);
+        if (sourceIsDesired && IsFullTextureSprite(sourceSprite))
+        {
+            candidate.ReuseExistingPng = true;
+            candidate.ActionLabel = "复用单图";
+            AddCandidateNote(candidate, "同名 PNG 是覆盖完整画布的 backing texture：保留 PNG 文件和 GUID，只对齐显示参数并迁移引用。");
+        }
+        else if (sourceIsDesired)
+        {
+            candidate.Blocked = true;
+            candidate.ActionLabel = "阻断：输出与图集源相同";
+            AddCandidateWarning(candidate, "Sprite 只占同名源纹理的一部分，直接覆盖会破坏同图集的其他切片。");
+            return;
+        }
+        else if (hasExistingPng)
+        {
+            candidate.OverwriteExistingPng = true;
+            candidate.ActionLabel = "从图集导出并覆盖同名 PNG";
+            AddCandidateNote(candidate, "同名 PNG 已存在：将备份后覆盖像素，但保留它当前的 GUID。");
+        }
+        else
+        {
+            candidate.ActionLabel = "从图集导出新 PNG";
+            AddCandidateNote(candidate, "将按完整 Sprite Rect 导出独立 PNG，不裁掉透明边缘。");
         }
 
         var settingDifferences = CompareSpriteImportSettings(sourceSprite, desired);
         if (settingDifferences.Count > 0)
         {
+            candidate.SettingDifferences.AddRange(settingDifferences);
+            AddCandidateNote(candidate, "将对齐 PNG 参数：" + string.Join("、", settingDifferences.ToArray()));
+        }
+    }
+
+    private static void FinalizeCandidateReferenceChecks(ConversionCandidate candidate)
+    {
+        if (candidate == null) return;
+        candidate.SerializedReferenceCount = candidate.MigratableReferenceCount;
+        if (candidate.AllGuidReferenceCount != candidate.MigratableReferenceCount)
+        {
             candidate.Blocked = true;
-            AddCandidateWarning(candidate, "同名 backing PNG 导入参数不一致：" + string.Join("、", settingDifferences.ToArray()));
-            return;
+            AddCandidateWarning(candidate, string.Format(
+                "发现 {0} 处旧 GUID 引用，其中只有 {1} 处是可迁移的 Sprite type:2 引用；已阻断该项。",
+                candidate.AllGuidReferenceCount, candidate.MigratableReferenceCount));
+        }
+
+        if (candidate.RuntimeStringReferencePaths.Count > 0)
+        {
+            AddCandidateWarning(candidate,
+                "发现疑似运行时字符串引用（只报告、不自动修改）：" +
+                string.Join("、", candidate.RuntimeStringReferencePaths.Take(4).ToArray()));
         }
 
         string[] fr2Referencers;
         string fr2Error;
         if (!TryGetFindReference2DirectReferencers(candidate.Guid, out fr2Referencers, out fr2Error))
         {
-            candidate.Blocked = true;
-            AddCandidateWarning(candidate, "依赖 FindReference2 缓存：" + fr2Error);
-            return;
+            AddCandidateNote(candidate, "FindReference2 交叉检查未运行（不阻断）：" + fr2Error);
         }
-        var nonTextReferencers = fr2Referencers
-            .Where(path => !IsUnitySerializedTextAsset(path))
-            .Take(4)
-            .ToArray();
-        if (nonTextReferencers.Length > 0)
+        else
         {
-            candidate.Blocked = true;
-            AddCandidateWarning(candidate,
-                "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
-            return;
+            var validReferencers = fr2Referencers
+                .Where(path => !string.Equals(path, candidate.AssetPath, StringComparison.OrdinalIgnoreCase))
+                .Where(path => !path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
+                .Where(path => !path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ||
+                               File.Exists(AssetPathToAbsolute(path)))
+                .ToArray();
+            var nonTextReferencers = validReferencers
+                .Where(path => !IsUnitySerializedTextAsset(path))
+                .Take(4)
+                .ToArray();
+            if (nonTextReferencers.Length > 0)
+            {
+                candidate.Blocked = true;
+                AddCandidateWarning(candidate,
+                    "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
+            }
+            var missingFromYamlScan = validReferencers
+                .Where(path => IsUnitySerializedTextAsset(path) &&
+                               !candidate.AllGuidReferencePaths.Contains(path))
+                .Take(4)
+                .ToArray();
+            if (missingFromYamlScan.Length > 0)
+            {
+                candidate.Blocked = true;
+                AddCandidateWarning(candidate,
+                    "FindReference2 与 YAML 扫描结果不一致，请刷新缓存后重试：" +
+                    string.Join("、", missingFromYamlScan));
+            }
+            AddCandidateNote(candidate, "FindReference2 检出 " + validReferencers.Length + " 个直接引用；它仅用于交叉检查。");
         }
-        AddCandidateNote(candidate, "FindReference2 检出 " + fr2Referencers.Length + " 个直接引用；转换时会逐项迁移并再次扫描旧 GUID。");
+        if (candidate.Blocked && !candidate.ActionLabel.StartsWith("阻断：", StringComparison.Ordinal))
+        {
+            candidate.ActionLabel = "阻断：" + candidate.ActionLabel;
+        }
+    }
+
+    private static bool IsFullTextureSprite(Sprite sprite)
+    {
+        if (sprite == null || sprite.texture == null) return false;
+        var rect = sprite.packed ? sprite.textureRect : sprite.rect;
+        return Mathf.RoundToInt(rect.x) == 0 && Mathf.RoundToInt(rect.y) == 0 &&
+               Mathf.RoundToInt(rect.width) == sprite.texture.width &&
+               Mathf.RoundToInt(rect.height) == sprite.texture.height;
     }
 
     private static bool TryCompareSpritePixels(Sprite sprite, string pngPath, out string difference)
@@ -501,6 +523,11 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     private static List<string> CompareSpriteImportSettings(Sprite sourceSprite, string pngPath)
     {
         var differences = new List<string>();
+        if (!File.Exists(AssetPathToAbsolute(pngPath)))
+        {
+            differences.Add("新建 Sprite/Full Rect");
+            return differences;
+        }
         var importer = AssetImporter.GetAtPath(pngPath) as TextureImporter;
         if (importer == null)
         {
@@ -530,6 +557,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         var textureSettings = new TextureImporterSettings();
         importer.ReadTextureSettings(textureSettings);
         var sourcePivot = GetNormalizedPivot(sourceSprite);
+        if (textureSettings.spriteMeshType != SpriteMeshType.FullRect) differences.Add("MeshType=Full Rect");
         if (textureSettings.spriteAlignment != (int)SpriteAlignment.Custom ||
             !Approximately(textureSettings.spritePivot, sourcePivot))
         {
@@ -547,25 +575,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     {
         return Mathf.Abs(a.x - b.x) <= 0.0001f && Mathf.Abs(a.y - b.y) <= 0.0001f &&
                Mathf.Abs(a.z - b.z) <= 0.0001f && Mathf.Abs(a.w - b.w) <= 0.0001f;
-    }
-
-    private static IEnumerable<string> FindRuntimeStringReferencePaths(string guid, string assetPath)
-    {
-        foreach (var absolutePath in EnumerateTextFiles())
-        {
-            if (IsUnitySerializedTextFile(absolutePath)) continue;
-            var path = AbsoluteToAssetPath(absolutePath);
-            if (string.Equals(path, assetPath, StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
-            string content;
-            try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
-            if ((!string.IsNullOrEmpty(guid) && content.IndexOf(guid, StringComparison.OrdinalIgnoreCase) >= 0) ||
-                content.IndexOf(assetPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                content.IndexOf(assetPath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                yield return path;
-            }
-        }
     }
 
     private static Texture2D CreatePreviewTexture(Sprite sprite)
@@ -627,47 +636,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         EditorGUIUtility.PingObject(target);
     }
 
-    private void DrawScanResult()
-    {
-        if (!hasScanned)
-        {
-            return;
-        }
-
-        EditorGUILayout.Space();
-        EditorGUILayout.LabelField(
-            string.Format("扫描 .asset：{0}    可转换 Sprite：{1}    Pivot 将归一化：{2}    问题：{3}",
-                scannedAssetCount, candidates.Count, candidates.Count(c => c.AlreadyConverted), pivotNormalizationCount, atlases.Count, scanProblems.Count + specialAssetReports.Count),
-            EditorStyles.miniBoldLabel);
-
-        if (existingReferenceRepairCount > 0)
-        {
-            EditorGUILayout.HelpBox("发现 " + existingReferenceRepairCount + " 个已生成 PNG 仍有 type:2 引用，转换时会自动修复。", MessageType.Info);
-        }
-
-        if (scanProblems.Count > 0)
-        {
-            EditorGUILayout.HelpBox(string.Join("\n", scanProblems.Take(8).ToArray()), MessageType.Warning);
-        }
-
-        if (specialAssetReports.Count > 0)
-        {
-            EditorGUILayout.HelpBox("特殊资源（仅报告并保留）：\n" + string.Join("\n", specialAssetReports.Take(10).ToArray()), MessageType.Info);
-        }
-
-        scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
-        foreach (var candidate in candidates)
-        {
-            var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(candidate.AssetPath);
-            var size = sprite == null
-                ? "无法读取"
-                : string.Format("{0} x {1}", Mathf.RoundToInt(sprite.rect.width), Mathf.RoundToInt(sprite.rect.height));
-            EditorGUILayout.LabelField(Path.GetFileName(candidate.AssetPath), size, EditorStyles.miniLabel);
-            EditorGUILayout.LabelField(candidate.AssetPath + " -> " + candidate.OutputPath, EditorStyles.miniLabel);
-        }
-        EditorGUILayout.EndScrollView();
-    }
-
     private void Scan()
     {
         if (isBusy) return;
@@ -700,8 +668,13 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
         scanPaths = paths;
         scanIndex = 0;
+        referenceScanPaths = new string[0];
+        referenceScanIndex = 0;
+        referenceFinalizeIndex = 0;
+        referenceScanPrepared = false;
+        scanCandidatesByGuid.Clear();
+        scanAtlasesByGuid.Clear();
         scannedAssetCount = paths.Length;
-        existingReferenceRepairCount = 0;
         hasScanned = false;
         isBusy = true;
         EditorApplication.update -= ScanStep;
@@ -726,13 +699,85 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             {
                 var path = scanPaths[scanIndex++];
                 ProcessScanPath(path);
-                var progress = scanPaths.Length == 0 ? 1f : (float)scanIndex / scanPaths.Length;
+                var progress = scanPaths.Length == 0 ? 0.35f : 0.35f * scanIndex / scanPaths.Length;
                 progressMessage = "预检：正在检查 " + path;
                 progressValue = progress;
                 if (EditorUtility.DisplayCancelableProgressBar("Sprite 预检", "正在检查 " + path, progress))
                 {
-                    scanProblems.Add("用户取消，剩余预检项目未处理。");
-                    scanIndex = scanPaths.Length;
+                    CancelScan();
+                }
+                Repaint();
+                return;
+            }
+
+            if (!referenceScanPrepared)
+            {
+                foreach (var candidate in candidates)
+                {
+                    if (!string.IsNullOrEmpty(candidate.Guid)) scanCandidatesByGuid[candidate.Guid] = candidate;
+                }
+                BuildAtlasGroups();
+                foreach (var atlas in atlases)
+                {
+                    if (!string.IsNullOrEmpty(atlas.SourceTextureGuid))
+                    {
+                        scanAtlasesByGuid[atlas.SourceTextureGuid] = atlas;
+                    }
+                }
+                referenceScanPaths = candidates.Count == 0
+                    ? new string[0]
+                    : Directory.GetFiles(Application.dataPath, "*", SearchOption.AllDirectories)
+                        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                referenceScanIndex = 0;
+                referenceFinalizeIndex = 0;
+                referenceScanPrepared = true;
+                progressMessage = "预检：准备扫描 Assets 引用";
+                progressValue = 0.35f;
+                EditorUtility.DisplayProgressBar("Sprite 预检", progressMessage, progressValue);
+                Repaint();
+                return;
+            }
+
+            if (referenceScanIndex < referenceScanPaths.Length)
+            {
+                var startedAt = EditorApplication.timeSinceStartup;
+                string currentPath = string.Empty;
+                do
+                {
+                    currentPath = referenceScanPaths[referenceScanIndex++];
+                    ProcessProjectReferencePath(currentPath);
+                }
+                while (referenceScanIndex < referenceScanPaths.Length &&
+                       EditorApplication.timeSinceStartup - startedAt < 0.006d);
+
+                var progress = referenceScanPaths.Length == 0
+                    ? 0.9f
+                    : 0.35f + 0.55f * referenceScanIndex / referenceScanPaths.Length;
+                var currentAssetPath = string.IsNullOrEmpty(currentPath) ? "Assets" : AbsoluteToAssetPath(currentPath);
+                progressMessage = "预检：正在建立引用索引 " + currentAssetPath;
+                progressValue = progress;
+                if (EditorUtility.DisplayCancelableProgressBar("Sprite 预检", progressMessage, progress))
+                {
+                    CancelScan();
+                }
+                Repaint();
+                return;
+            }
+
+            if (referenceFinalizeIndex < candidates.Count)
+            {
+                var candidate = candidates[referenceFinalizeIndex++];
+                FinalizeCandidateReferenceChecks(candidate);
+                AddConversionWarnings(candidate);
+                var progress = candidates.Count == 0
+                    ? 1f
+                    : 0.9f + 0.1f * referenceFinalizeIndex / candidates.Count;
+                progressMessage = "预检：正在汇总 " + candidate.AssetPath;
+                progressValue = progress;
+                if (EditorUtility.DisplayCancelableProgressBar("Sprite 预检", progressMessage, progress))
+                {
+                    CancelScan();
                 }
                 Repaint();
                 return;
@@ -755,6 +800,101 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             EditorApplication.update -= ScanStep;
             EditorUtility.ClearProgressBar();
             Repaint();
+        }
+    }
+
+    private void CancelScan()
+    {
+        scanProblems.Add("用户取消，预检结果不完整，所有候选项均已阻断。重新预检后才可转换。");
+        foreach (var candidate in candidates)
+        {
+            candidate.Blocked = true;
+            AddCandidateWarning(candidate, "预检被取消，该条目不会转换。");
+        }
+        BuildAtlasGroups();
+        hasScanned = true;
+        isBusy = false;
+        EditorApplication.update -= ScanStep;
+        EditorUtility.ClearProgressBar();
+    }
+
+    private void ProcessProjectReferencePath(string absolutePath)
+    {
+        if (string.IsNullOrEmpty(absolutePath) || absolutePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var assetPath = AbsoluteToAssetPath(absolutePath);
+        if (assetPath.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var isYaml = IsUnitySerializedTextFile(absolutePath);
+        if (!isYaml && !TextExtensions.Contains(Path.GetExtension(absolutePath))) return;
+
+        string content;
+        try
+        {
+            content = File.ReadAllText(absolutePath);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        if (isYaml)
+        {
+            foreach (Match match in SerializedGuidRegex.Matches(content))
+            {
+                var guid = match.Groups[1].Value;
+                ConversionCandidate candidate;
+                if (scanCandidatesByGuid.TryGetValue(guid, out candidate))
+                {
+                    candidate.AllGuidReferenceCount++;
+                    candidate.AllGuidReferencePaths.Add(assetPath);
+                }
+                AtlasInfo atlas;
+                if (scanAtlasesByGuid.TryGetValue(guid, out atlas))
+                {
+                    atlas.GuidReferencePaths.Add(assetPath);
+                }
+            }
+
+            foreach (Match match in SerializedSpriteReferenceRegex.Matches(content))
+            {
+                ConversionCandidate candidate;
+                long localId;
+                if (!scanCandidatesByGuid.TryGetValue(match.Groups[2].Value, out candidate) ||
+                    !long.TryParse(match.Groups[1].Value, out localId) || localId != candidate.LocalId)
+                {
+                    continue;
+                }
+                candidate.MigratableReferenceCount++;
+                candidate.SerializedReferencePaths.Add(assetPath);
+            }
+            return;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if ((!string.IsNullOrEmpty(candidate.Guid) &&
+                 content.IndexOf(candidate.Guid, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                content.IndexOf(candidate.AssetPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf(candidate.AssetPath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                candidate.RuntimeStringReferencePaths.Add(assetPath);
+            }
+        }
+        foreach (var atlas in scanAtlasesByGuid.Values)
+        {
+            if (content.IndexOf(atlas.SourceTextureGuid, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf(atlas.SourceTexturePath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf(atlas.SourceTexturePath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                atlas.RuntimeStringReferencePaths.Add(assetPath);
+            }
         }
     }
 
@@ -799,11 +939,9 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             return;
         }
         var normalizedPivot = GetNormalizedPivot(sprite);
-        if (RequiresPivotNormalization(normalizedPivot)) pivotNormalizationCount++;
         var hasOffset = HasSerializedOffset(path);
         if (hasOffset) layoutApproximationCount++;
-        bool alreadyConverted;
-        var outputPath = GetOutputPath(path, guid, out alreadyConverted);
+        var outputPath = GetOutputPath(path);
         var candidate = new ConversionCandidate
         {
             AssetPath = path,
@@ -815,127 +953,10 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             NormalizedPivot = normalizedPivot,
             ApproximatePivot = RequiresPivotNormalization(normalizedPivot),
             HasOffset = hasOffset,
-            AlreadyConverted = alreadyConverted,
             Packed = sprite.packed
         };
         ConfigureExistingPngCandidate(candidate);
-        AddConversionWarnings(candidate);
         candidates.Add(candidate);
-    }
-
-    private void ScanSynchronously()
-    {
-        ClearScan();
-
-        string normalizedFolder;
-        string error;
-        if (!TryNormalizeFolder(folderPath, out normalizedFolder, out error))
-        {
-            scanProblems.Add(error);
-            hasScanned = true;
-            return;
-        }
-
-        SetFolderPath(normalizedFolder);
-        var absoluteFolder = AssetPathToAbsolute(normalizedFolder);
-        string[] paths;
-        try
-        {
-            paths = Directory.GetFiles(absoluteFolder, "*.asset", SearchOption.AllDirectories)
-                .Select(AbsoluteToAssetPath)
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-        }
-        catch (Exception exception)
-        {
-            scanProblems.Add("扫描目录失败：" + exception.Message);
-            hasScanned = true;
-            return;
-        }
-        scannedAssetCount = paths.Length;
-
-        foreach (var path in paths)
-        {
-            var sprite = AssetDatabase.LoadMainAssetAtPath(path) as Sprite;
-            if (sprite == null)
-            {
-                var mainAsset = AssetDatabase.LoadMainAssetAtPath(path);
-                if (mainAsset != null && string.Equals(mainAsset.GetType().Name, "TMP_SpriteAsset", StringComparison.Ordinal))
-                {
-                    specialAssetReports.Add(path + "（TMP SpriteAsset，图集与字符映射不自动拆分）");
-                }
-                continue;
-            }
-
-            if (sprite.texture == null)
-            {
-                scanProblems.Add(path + "：Sprite 没有源纹理，已跳过。");
-                continue;
-            }
-
-            var sourceTexturePath = AssetDatabase.GetAssetPath(sprite.texture);
-            if (!sourceTexturePath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
-            {
-                scanProblems.Add(path + "：源纹理不是 PNG，已跳过。");
-                continue;
-            }
-
-            if (sprite.packed && sprite.packingRotation != SpritePackingRotation.None)
-            {
-                scanProblems.Add(path + "：Sprite 使用了旋转图集打包，已跳过以避免导出方向错误。");
-                continue;
-            }
-
-            string guid;
-            long localId;
-            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out guid, out localId) ||
-                string.IsNullOrEmpty(guid))
-            {
-                scanProblems.Add(path + "：无法读取资源 GUID，已跳过。");
-                continue;
-            }
-
-            if (localId != 21300000)
-            {
-                scanProblems.Add(path + "：fileID 不是 21300000，无法保证引用不变，已跳过。");
-                continue;
-            }
-
-            var normalizedPivot = GetNormalizedPivot(sprite);
-            if (RequiresPivotNormalization(normalizedPivot))
-            {
-                pivotNormalizationCount++;
-            }
-            if (HasSerializedOffset(path))
-            {
-                layoutApproximationCount++;
-            }
-
-            bool alreadyConverted;
-            var outputPath = GetOutputPath(path, guid, out alreadyConverted);
-            var candidate = new ConversionCandidate
-            {
-                AssetPath = path,
-                Guid = guid,
-                LocalId = localId,
-                SourceTexturePath = sourceTexturePath,
-                SourceTextureGuid = AssetDatabase.AssetPathToGUID(sourceTexturePath),
-                OutputPath = outputPath,
-                NormalizedPivot = normalizedPivot,
-                ApproximatePivot = RequiresPivotNormalization(normalizedPivot),
-                HasOffset = HasSerializedOffset(path),
-                AlreadyConverted = alreadyConverted,
-                Packed = sprite.packed
-            };
-            ConfigureExistingPngCandidate(candidate);
-            AddConversionWarnings(candidate);
-            candidates.Add(candidate);
-        }
-
-        BuildAtlasGroups();
-        existingReferenceRepairCount = CountExistingReferenceRepairs();
-        hasScanned = true;
-        Repaint();
     }
 
     private void ConvertAll()
@@ -1022,15 +1043,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 run.Refreshed = true;
                 return;
             }
-            if (!run.Repaired)
-            {
-                progressMessage = "转换：修复已生成 PNG 的旧引用";
-                progressValue = 0.95f;
-                EditorUtility.DisplayProgressBar("Sprite 转 PNG", "修复已生成 PNG 的旧引用", 0.95f);
-                run.RepairedReferences = RepairExistingConvertedReferences(run.BackupRoot);
-                run.Repaired = true;
-                return;
-            }
             if (!run.AtlasChecked)
             {
                 progressMessage = "转换：检查图集引用并等待删除确认";
@@ -1061,7 +1073,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         summary.AppendLine("转换成功：" + run.Successes.Count);
         summary.AppendLine("复用现有 PNG 并删除旧 .asset：" + run.ReusedPng);
         summary.AppendLine("失败/未处理：" + run.Failures.Count);
-        summary.AppendLine("修复既有 PNG 引用：" + run.RepairedReferences);
         summary.AppendLine("删除未引用图集：" + run.DeletedAtlases.Count);
         summary.AppendLine("保留图集：" + run.KeptAtlases.Count);
         summary.AppendLine("备份：" + run.BackupRoot);
@@ -1076,144 +1087,87 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         Scan();
     }
 
-    private void ConvertAllSynchronously()
-    {
-        if (!EditorUtility.DisplayDialog(
-                "确认批量转换",
-                string.Format(
-                    "将转换 {0} 个 Sprite .asset。\n\n原文件会备份到项目 Library/SpriteAssetToPngBackups，转换成功后原 .asset 会被删除。Unity 序列化引用保持不变，但代码中的字符串路径不会自动更新。是否继续？",
-                    candidates.Count),
-                "转换",
-                "取消"))
-        {
-            return;
-        }
-
-        isBusy = true;
-        var batchName = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        var backupRoot = Path.Combine(ProjectRoot, "Library", "SpriteAssetToPngBackups", batchName);
-        var successes = new List<string>();
-        var failures = new List<string>();
-        var pending = candidates.Where(candidate => !candidate.Blocked).ToArray();
-        var deletedAtlases = new List<string>();
-        var keptAtlases = new List<string>();
-        var repairedReferences = 0;
-
-        try
-        {
-            for (var index = 0; index < pending.Length; index++)
-            {
-                var candidate = pending[index];
-                var path = candidate.AssetPath;
-                if (EditorUtility.DisplayCancelableProgressBar(
-                        "Sprite .asset 转 PNG",
-                        candidate.AssetPath,
-                        (float)index / pending.Length))
-                {
-                    failures.Add("用户取消，剩余项目未处理。");
-                    break;
-                }
-
-                string outputPath;
-                string error;
-                if (TryConvert(candidate, backupRoot, out outputPath, out error))
-                {
-                    successes.Add(candidate.AssetPath + " -> " + outputPath);
-                }
-                else
-                {
-                    AddCandidateWarning(candidate, "转换失败：" + error);
-                    failures.Add(path + "：" + error);
-                }
-            }
-            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-            repairedReferences = RepairExistingConvertedReferences(backupRoot);
-            if (repairedReferences > 0)
-            {
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-            }
-            DeleteUnusedAtlases(backupRoot, successes, pending, deletedAtlases, keptAtlases);
-        }
-        finally
-        {
-            EditorUtility.ClearProgressBar();
-            isBusy = false;
-            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-            Scan();
-        }
-
-        var summary = new StringBuilder();
-        summary.AppendLine("成功：" + successes.Count);
-        summary.AppendLine("失败/未处理：" + failures.Count);
-        summary.AppendLine("备份：" + backupRoot);
-        summary.AppendLine("修复既有 PNG 引用：" + repairedReferences);
-        summary.AppendLine("删除未引用图集：" + deletedAtlases.Count);
-        summary.AppendLine("保留图集：" + keptAtlases.Count);
-        if (failures.Count > 0)
-        {
-            summary.AppendLine();
-            summary.AppendLine(string.Join("\n", failures.Take(10).ToArray()));
-        }
-
-        Debug.Log("[Sprite Asset To PNG]\n" + summary +
-                  (successes.Count > 0 ? "\n" + string.Join("\n", successes.ToArray()) : string.Empty));
-        EditorUtility.DisplayDialog("转换完成", summary.ToString(), "确定");
-    }
-
     private static bool TryConvert(ConversionCandidate candidate, string backupRoot, out string outputPath, out string error)
     {
         var assetPath = candidate.AssetPath;
         outputPath = candidate.OutputPath;
         error = string.Empty;
 
-        var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
-        if (sprite == null || sprite.texture == null)
+        var sourceSprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
+        if (sourceSprite == null || sourceSprite.texture == null)
         {
-            error = "无法读取 Sprite 或源纹理。";
+            error = "无法读取 Sprite 或源纹理；.asset 本身不包含可恢复的 PNG 像素。";
             return false;
         }
 
         string oldGuid;
         long oldLocalId;
-        if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out oldGuid, out oldLocalId))
+        if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sourceSprite, out oldGuid, out oldLocalId))
         {
-            error = "无法读取原 GUID/fileID。";
+            error = "无法读取原 .asset 的 GUID/fileID。";
+            return false;
+        }
+        if (!string.Equals(oldGuid, candidate.Guid, StringComparison.OrdinalIgnoreCase) ||
+            oldLocalId != candidate.LocalId)
+        {
+            error = "原 .asset 的 GUID/fileID 在预检后发生变化，请重新预检。";
             return false;
         }
 
-        var settings = SpriteSettings.Capture(sprite, AssetImporter.GetAtPath(assetPath));
-        var labels = AssetDatabase.GetLabels(sprite);
-        if (candidate.ReuseExistingPng)
+        var sourceWidth = Mathf.RoundToInt(sourceSprite.rect.width);
+        var sourceHeight = Mathf.RoundToInt(sourceSprite.rect.height);
+        var settings = SpriteSettings.Capture(sourceSprite, AssetImporter.GetAtPath(assetPath));
+        var labels = AssetDatabase.GetLabels(sourceSprite);
+        byte[] pngBytes = null;
+        if (!candidate.ReuseExistingPng)
         {
-            return TryReuseExistingPng(candidate, sprite, labels, backupRoot, oldGuid, oldLocalId,
-                out outputPath, out error);
-        }
-        byte[] pngBytes;
-        try
-        {
-            pngBytes = ExtractPng(sprite);
-        }
-        catch (Exception exception)
-        {
-            error = "提取像素失败：" + exception.Message;
-            return false;
+            try
+            {
+                pngBytes = ExtractPng(sourceSprite);
+            }
+            catch (Exception exception)
+            {
+                error = "提取 Sprite Rect 像素失败：" + exception.Message;
+                return false;
+            }
         }
 
         var absoluteAssetPath = AssetPathToAbsolute(assetPath);
         var absoluteOutputPath = AssetPathToAbsolute(outputPath);
-        var tempOutputPath = CreateTemporaryImportPath();
-        var absoluteTempOutputPath = AssetPathToAbsolute(tempOutputPath);
         var backupAssetPath = Path.Combine(backupRoot, assetPath.Replace('/', Path.DirectorySeparatorChar));
         var backupMetaPath = backupAssetPath + ".meta";
-        var referenceEdits = new List<ReferenceEdit>();
         var outputBackupPath = Path.Combine(backupRoot, "Outputs", outputPath.Replace('/', Path.DirectorySeparatorChar));
         var outputBackupMetaPath = outputBackupPath + ".meta";
         var hadOutput = File.Exists(absoluteOutputPath);
         var hadOutputMeta = File.Exists(absoluteOutputPath + ".meta");
-        var transactionActive = false;
+        var referenceEdits = new List<ReferenceEdit>();
 
         try
         {
+            if (candidate.ReuseExistingPng && (!hadOutput || !hadOutputMeta))
+            {
+                throw new InvalidOperationException("预检时准备复用的同名 PNG 或 meta 已不存在，请重新预检。");
+            }
+
+            string[] fr2Referencers;
+            string fr2Error;
+            if (TryGetFindReference2DirectReferencers(oldGuid, out fr2Referencers, out fr2Error))
+            {
+                var nonTextReferencers = fr2Referencers
+                    .Where(path => !string.Equals(path, candidate.AssetPath, StringComparison.OrdinalIgnoreCase))
+                    .Where(path => !path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase))
+                    .Where(path => !path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ||
+                                   File.Exists(AssetPathToAbsolute(path)))
+                    .Where(path => !IsUnitySerializedTextAsset(path))
+                    .Take(4)
+                    .ToArray();
+                if (nonTextReferencers.Length > 0)
+                {
+                    throw new InvalidOperationException(
+                        "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
+                }
+            }
+
             Directory.CreateDirectory(Path.GetDirectoryName(absoluteOutputPath) ?? ProjectRoot);
             Directory.CreateDirectory(Path.GetDirectoryName(backupAssetPath) ?? backupRoot);
             File.Copy(absoluteAssetPath, backupAssetPath, true);
@@ -1225,108 +1179,95 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 if (hadOutputMeta) File.Copy(absoluteOutputPath + ".meta", outputBackupMetaPath, true);
             }
 
-            File.WriteAllBytes(absoluteTempOutputPath, pngBytes);
-            AssetDatabase.ImportAsset(tempOutputPath,
+            if (!candidate.ReuseExistingPng)
+            {
+                File.WriteAllBytes(absoluteOutputPath, pngBytes);
+            }
+            AssetDatabase.ImportAsset(outputPath,
                 ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
 
-            var importer = AssetImporter.GetAtPath(tempOutputPath) as TextureImporter;
+            var importer = AssetImporter.GetAtPath(outputPath) as TextureImporter;
             if (importer == null)
             {
-                throw new InvalidOperationException("Unity 没有为输出文件创建 TextureImporter。");
+                throw new InvalidOperationException("Unity 没有为最终 PNG 创建 TextureImporter。");
             }
-
             settings.Apply(importer);
-            ApplySpriteGeometry(sprite, importer);
             importer.SaveAndReimport();
 
-            var temporarySprite = AssetDatabase.LoadAssetAtPath<Sprite>(tempOutputPath);
-            string geometryError;
-            if (!TryValidateSpriteGeometry(sprite, temporarySprite, out geometryError))
+            var converted = AssetDatabase.LoadAssetAtPath<Sprite>(outputPath);
+            string targetGuid;
+            long targetLocalId;
+            if (converted == null ||
+                !AssetDatabase.TryGetGUIDAndLocalFileIdentifier(converted, out targetGuid, out targetLocalId) ||
+                string.IsNullOrEmpty(targetGuid) || targetLocalId != SpriteLocalId)
             {
-                throw new InvalidOperationException("Sprite 几何迁移校验失败：" + geometryError);
+                throw new InvalidOperationException("最终 PNG 无法作为单 Sprite 加载或其 fileID 不是 21300000。");
+            }
+            if (!string.IsNullOrEmpty(candidate.ExistingPngGuid) &&
+                !string.Equals(targetGuid, candidate.ExistingPngGuid, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("最终 PNG 的 GUID 发生变化；为避免破坏它原有引用，已回滚。");
             }
 
-            var tempOutputMetaPath = absoluteTempOutputPath + ".meta";
-            var outputMeta = File.ReadAllText(tempOutputMetaPath);
-            var outputMetaPath = absoluteOutputPath + ".meta";
-            if (!GuidLineRegex.IsMatch(outputMeta))
+            string displayError;
+            if (!TryValidateSpriteDisplay(settings, sourceWidth, sourceHeight, converted, importer, out displayError))
             {
-                throw new InvalidOperationException("输出 PNG 的 meta 中没有有效 GUID。");
+                throw new InvalidOperationException("最终 PNG 显示参数校验失败：" + displayError);
             }
-
-            outputMeta = GuidLineRegex.Replace(outputMeta, "guid: " + oldGuid, 1);
-
-            // Keep both unregister operations inside the asset-editing transaction so a
-            // batch does not trigger a full AssetDatabase refresh for every candidate.
-            AssetDatabase.StartAssetEditing();
-            AssetDatabase.DisallowAutoRefresh();
-            transactionActive = true;
-
-            // Remove the temporary import and any previous target registration before
-            // registering the target path with the original Sprite GUID.
-            if (!AssetDatabase.DeleteAsset(tempOutputPath))
+            if (!candidate.ReuseExistingPng)
             {
-                throw new InvalidOperationException("无法清理临时 PNG 导入记录。");
-            }
-
-            if (hadOutput || hadOutputMeta)
-            {
-                if (!AssetDatabase.DeleteAsset(outputPath))
+                string pixelError;
+                if (!TryCompareSpritePixels(sourceSprite, outputPath, out pixelError))
                 {
-                    throw new InvalidOperationException("无法清理已有 PNG 导入记录。");
+                    throw new InvalidOperationException("最终 PNG 像素校验失败：" + pixelError);
                 }
             }
 
-            referenceEdits = PrepareReferenceEdits(oldGuid, oldLocalId, oldGuid, SpriteLocalId, assetPath, backupRoot);
-
-            if (!AssetDatabase.DeleteAsset(assetPath))
+            referenceEdits = PrepareReferenceEdits(
+                oldGuid, oldLocalId, targetGuid, targetLocalId, assetPath, backupRoot,
+                candidate.SerializedReferencePaths);
+            var preparedReferenceCount = referenceEdits.Sum(edit => edit.ReplacementCount);
+            if (preparedReferenceCount != candidate.SerializedReferenceCount)
             {
-                throw new InvalidOperationException("无法通过 AssetDatabase 删除原 Sprite .asset。");
+                throw new InvalidOperationException(string.Format(
+                    "预检后引用发生变化：预期迁移 {0} 处，当前找到 {1} 处；原 .asset 未删除，请重新预检。",
+                    candidate.SerializedReferenceCount, preparedReferenceCount));
+            }
+            foreach (var edit in referenceEdits)
+            {
+                File.WriteAllText(edit.AbsolutePath, edit.UpdatedContent, new UTF8Encoding(false));
             }
 
+            var remainingReferences = CountGuidReferencesInPaths(oldGuid, candidate.AllGuidReferencePaths);
+            if (remainingReferences > 0)
+            {
+                throw new InvalidOperationException(
+                    "迁移后仍发现 " + remainingReferences + " 处旧 GUID 序列化引用，原 .asset 未删除。");
+            }
+
+            AssetDatabase.DisallowAutoRefresh();
             try
             {
-                DeleteFileIfExists(absoluteOutputPath);
-                DeleteFileIfExists(outputMetaPath);
-                DeleteFileIfExists(absoluteAssetPath);
-                DeleteFileIfExists(absoluteAssetPath + ".meta");
-                DeleteFileIfExists(absoluteTempOutputPath);
-                DeleteFileIfExists(tempOutputMetaPath);
-                File.WriteAllBytes(absoluteOutputPath, pngBytes);
-                File.WriteAllText(outputMetaPath, outputMeta, new UTF8Encoding(false));
-                foreach (var edit in referenceEdits)
+                if (!AssetDatabase.DeleteAsset(assetPath))
                 {
-                    File.WriteAllText(edit.AbsolutePath, edit.UpdatedContent, new UTF8Encoding(false));
+                    throw new InvalidOperationException("无法删除已无序列化引用的原 Sprite .asset。");
                 }
             }
             finally
             {
-                try
-                {
-                    AssetDatabase.StopAssetEditing();
-                }
-                finally
-                {
-                    AssetDatabase.AllowAutoRefresh();
-                }
-                transactionActive = false;
+                AssetDatabase.AllowAutoRefresh();
             }
 
-            AssetDatabase.ImportAsset(outputPath, ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-            var converted = AssetDatabase.LoadAssetAtPath<Sprite>(outputPath);
-            string convertedGuid = string.Empty;
-            long convertedLocalId = 0L;
-            var hasConvertedIdentity = converted != null &&
-                AssetDatabase.TryGetGUIDAndLocalFileIdentifier(converted, out convertedGuid, out convertedLocalId);
-            if (!hasConvertedIdentity ||
-                !string.Equals(convertedGuid, oldGuid, StringComparison.OrdinalIgnoreCase) ||
-                convertedLocalId != oldLocalId)
+            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
+            converted = AssetDatabase.LoadAssetAtPath<Sprite>(outputPath);
+            string finalGuid;
+            long finalLocalId;
+            if (converted == null ||
+                !AssetDatabase.TryGetGUIDAndLocalFileIdentifier(converted, out finalGuid, out finalLocalId) ||
+                !string.Equals(finalGuid, targetGuid, StringComparison.OrdinalIgnoreCase) ||
+                finalLocalId != targetLocalId)
             {
-                throw new InvalidOperationException(string.Format(
-                    "转换后的 GUID/fileID 与原资源不一致，已回滚。期望 {0}/{1}，实际 {2}/{3}。",
-                    oldGuid, oldLocalId,
-                    hasConvertedIdentity ? convertedGuid : "<无法读取>",
-                    hasConvertedIdentity ? convertedLocalId.ToString() : "<无法读取>"));
+                throw new InvalidOperationException("删除原 .asset 后最终 PNG 身份校验失败，已回滚。");
             }
 
             AssetDatabase.SetLabels(converted, labels);
@@ -1335,21 +1276,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
         catch (Exception exception)
         {
-            if (transactionActive)
-            {
-                try { AssetDatabase.StopAssetEditing(); } catch (Exception) { }
-                try { AssetDatabase.AllowAutoRefresh(); } catch (Exception) { }
-            }
-            try
-            {
-                if (File.Exists(absoluteTempOutputPath) || File.Exists(absoluteTempOutputPath + ".meta"))
-                {
-                    AssetDatabase.DeleteAsset(tempOutputPath);
-                }
-            }
-            catch (Exception) { }
-            DeleteFileIfExists(absoluteTempOutputPath);
-            DeleteFileIfExists(absoluteTempOutputPath + ".meta");
             RollBack(assetPath, outputPath, backupAssetPath, backupMetaPath,
                 outputBackupPath, outputBackupMetaPath, hadOutput, hadOutputMeta, referenceEdits);
             error = exception.Message;
@@ -1357,408 +1283,64 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
     }
 
-    private static bool TryReuseExistingPng(
-        ConversionCandidate candidate,
-        Sprite sourceSprite,
-        string[] labels,
-        string backupRoot,
-        string oldGuid,
-        long oldLocalId,
-        out string outputPath,
+    private static bool TryValidateSpriteDisplay(
+        SpriteSettings expected,
+        int expectedWidth,
+        int expectedHeight,
+        Sprite actual,
+        TextureImporter importer,
         out string error)
     {
-        outputPath = candidate.OutputPath;
         error = string.Empty;
-        var assetPath = candidate.AssetPath;
-        var pngPath = candidate.OutputPath;
-        var absoluteAssetPath = AssetPathToAbsolute(assetPath);
-        var absolutePngPath = AssetPathToAbsolute(pngPath);
-        var backupAssetPath = Path.Combine(backupRoot, assetPath.Replace('/', Path.DirectorySeparatorChar));
-        var backupMetaPath = backupAssetPath + ".meta";
-        var outputBackupPath = Path.Combine(backupRoot, "Outputs", pngPath.Replace('/', Path.DirectorySeparatorChar));
-        var outputBackupMetaPath = outputBackupPath + ".meta";
-        var referenceEdits = new List<ReferenceEdit>();
-        var transactionActive = false;
-        var hadOutput = File.Exists(absolutePngPath);
-        var hadOutputMeta = File.Exists(absolutePngPath + ".meta");
-
-        try
+        if (actual == null || actual.texture == null || importer == null)
         {
-            if (!hadOutput || !hadOutputMeta || string.IsNullOrEmpty(candidate.ExistingPngGuid))
-            {
-                throw new InvalidOperationException("复用目标 PNG 或其 meta/GUID 已不存在，请重新预检。");
-            }
-
-            string[] fr2Referencers;
-            string fr2Error;
-            if (!TryGetFindReference2DirectReferencers(oldGuid, out fr2Referencers, out fr2Error))
-            {
-                throw new InvalidOperationException("依赖 FindReference2 缓存：" + fr2Error);
-            }
-            var nonTextReferencers = fr2Referencers.Where(path => !IsUnitySerializedTextAsset(path)).Take(4).ToArray();
-            if (nonTextReferencers.Length > 0)
-            {
-                throw new InvalidOperationException(
-                    "FindReference2 检出无法安全文本迁移的直接引用：" + string.Join("、", nonTextReferencers));
-            }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(absoluteAssetPath) ?? ProjectRoot);
-            Directory.CreateDirectory(Path.GetDirectoryName(backupAssetPath) ?? backupRoot);
-            File.Copy(absoluteAssetPath, backupAssetPath, true);
-            File.Copy(absoluteAssetPath + ".meta", backupMetaPath, true);
-            Directory.CreateDirectory(Path.GetDirectoryName(outputBackupPath) ?? backupRoot);
-            File.Copy(absolutePngPath, outputBackupPath, true);
-            File.Copy(absolutePngPath + ".meta", outputBackupMetaPath, true);
-
-            var importer = AssetImporter.GetAtPath(pngPath) as TextureImporter;
-            if (importer == null) throw new InvalidOperationException("复用目标 PNG 没有 TextureImporter。");
-            ApplySpriteGeometry(sourceSprite, importer);
-            importer.SaveAndReimport();
-
-            var geometryTarget = AssetDatabase.LoadAssetAtPath<Sprite>(pngPath);
-            string geometryError;
-            if (!TryValidateSpriteGeometry(sourceSprite, geometryTarget, out geometryError))
-            {
-                throw new InvalidOperationException("Sprite 几何迁移校验失败：" + geometryError);
-            }
-
-            referenceEdits = PrepareReferenceEdits(
-                oldGuid, oldLocalId, candidate.ExistingPngGuid, SpriteLocalId, assetPath, backupRoot);
-            foreach (var edit in referenceEdits)
-            {
-                File.WriteAllText(edit.AbsolutePath, edit.UpdatedContent, new UTF8Encoding(false));
-            }
-
-            var remainingReferences = CountSerializedGuidReferences(oldGuid, assetPath);
-            if (remainingReferences > 0)
-            {
-                throw new InvalidOperationException("迁移后仍发现 " + remainingReferences + " 处旧 GUID 序列化引用，已阻断删除。");
-            }
-
-            AssetDatabase.StartAssetEditing();
-            AssetDatabase.DisallowAutoRefresh();
-            transactionActive = true;
-            if (!AssetDatabase.DeleteAsset(assetPath))
-            {
-                throw new InvalidOperationException("无法删除已无引用的原 Sprite .asset。");
-            }
-            AssetDatabase.StopAssetEditing();
-            AssetDatabase.AllowAutoRefresh();
-            transactionActive = false;
-
-            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
-            var converted = AssetDatabase.LoadAssetAtPath<Sprite>(pngPath);
-            string convertedGuid;
-            long convertedLocalId;
-            if (converted == null || !AssetDatabase.TryGetGUIDAndLocalFileIdentifier(converted, out convertedGuid, out convertedLocalId) ||
-                !string.Equals(convertedGuid, candidate.ExistingPngGuid, StringComparison.OrdinalIgnoreCase) ||
-                convertedLocalId != SpriteLocalId)
-            {
-                throw new InvalidOperationException("复用后的 PNG GUID/fileID 校验失败，已回滚。");
-            }
-            AssetDatabase.SetLabels(converted, labels);
-            EditorUtility.SetDirty(converted);
-            return true;
-        }
-        catch (Exception exception)
-        {
-            if (transactionActive)
-            {
-                try { AssetDatabase.StopAssetEditing(); } catch (Exception) { }
-                try { AssetDatabase.AllowAutoRefresh(); } catch (Exception) { }
-            }
-            RollBack(assetPath, pngPath, backupAssetPath, backupMetaPath,
-                outputBackupPath, outputBackupMetaPath, hadOutput, hadOutputMeta, referenceEdits);
-            error = exception.Message;
+            error = "Sprite 或 TextureImporter 无法读取";
             return false;
         }
-    }
-
-    private static void ApplySpriteGeometry(Sprite sourceSprite, TextureImporter importer)
-    {
-        if (sourceSprite == null || importer == null) throw new ArgumentNullException();
-
-        var factories = new SpriteDataProviderFactories();
-        factories.Init();
-        var provider = factories.GetSpriteEditorDataProviderFromObject(importer);
-        if (provider == null)
+        if (Mathf.RoundToInt(actual.rect.width) != expectedWidth ||
+            Mathf.RoundToInt(actual.rect.height) != expectedHeight)
         {
-            throw new InvalidOperationException("目标 PNG 不支持 Unity 2D Sprite DataProvider，无法迁移 Sprite 几何数据。");
-        }
-        provider.InitSpriteEditorDataProvider();
-        var spriteRects = provider.GetSpriteRects();
-        if (spriteRects == null || spriteRects.Length == 0)
-        {
-            throw new InvalidOperationException("目标 PNG 没有可写入的 SpriteRect。");
-        }
-
-        var targetRect = spriteRects[0];
-        var sourceRect = sourceSprite.packed ? sourceSprite.textureRect : sourceSprite.rect;
-        var width = Mathf.RoundToInt(sourceRect.width);
-        var height = Mathf.RoundToInt(sourceRect.height);
-        targetRect.name = sourceSprite.name;
-        targetRect.rect = new Rect(0f, 0f, width, height);
-        targetRect.border = sourceSprite.border;
-        targetRect.pivot = GetNormalizedPivot(sourceSprite);
-        targetRect.alignment = SpriteAlignment.Custom;
-        provider.SetSpriteRects(spriteRects);
-
-        var spriteId = targetRect.spriteID;
-        var pixelOffset = new Vector2(
-            sourceSprite.pivot.x - sourceRect.width * 0.5f,
-            sourceSprite.pivot.y - sourceRect.height * 0.5f);
-        var pixelsPerUnit = sourceSprite.pixelsPerUnit <= 0f ? 1f : sourceSprite.pixelsPerUnit;
-
-        var meshProvider = provider.GetDataProvider<ISpriteMeshDataProvider>();
-        if (meshProvider != null)
-        {
-            var sourceVertices = sourceSprite.vertices ?? new Vector2[0];
-            var vertices = new Vertex2DMetaData[sourceVertices.Length];
-            for (var i = 0; i < sourceVertices.Length; i++)
-            {
-                vertices[i] = new Vertex2DMetaData
-                {
-                    position = sourceVertices[i] * pixelsPerUnit + pixelOffset,
-                    boneWeight = new BoneWeight()
-                };
-            }
-            var sourceTriangles = sourceSprite.triangles;
-            var indices = sourceTriangles == null
-                ? new int[0]
-                : sourceTriangles.Select(index => (int)index).ToArray();
-            var edges = BuildMeshEdges(indices, sourceVertices.Length);
-            meshProvider.SetVertices(spriteId, vertices);
-            meshProvider.SetIndices(spriteId, indices);
-            meshProvider.SetEdges(spriteId, edges);
-
-            var outlineProvider = provider.GetDataProvider<ISpriteOutlineDataProvider>();
-            if (outlineProvider != null && edges.Length > 0)
-            {
-                outlineProvider.SetOutlines(spriteId,
-                    BuildMeshOutlines(vertices.Select(vertex => vertex.position).ToArray(), edges));
-            }
-        }
-
-        var physicsProvider = provider.GetDataProvider<ISpritePhysicsOutlineDataProvider>();
-        if (physicsProvider != null)
-        {
-            var physicsShapes = new List<Vector2[]>();
-            var shapeCount = sourceSprite.GetPhysicsShapeCount();
-            for (var shapeIndex = 0; shapeIndex < shapeCount; shapeIndex++)
-            {
-                var shape = new List<Vector2>();
-                sourceSprite.GetPhysicsShape(shapeIndex, shape);
-                if (shape.Count == 0) continue;
-                var converted = new Vector2[shape.Count];
-                for (var pointIndex = 0; pointIndex < shape.Count; pointIndex++)
-                {
-                    converted[pointIndex] = shape[pointIndex] * pixelsPerUnit + pixelOffset;
-                }
-                physicsShapes.Add(converted);
-            }
-            physicsProvider.SetOutlines(spriteId, physicsShapes);
-        }
-
-        provider.Apply();
-    }
-
-    private static Vector2Int[] BuildMeshEdges(int[] triangles, int vertexCount)
-    {
-        if (triangles == null || triangles.Length < 3 || vertexCount <= 0) return new Vector2Int[0];
-        var edgeCounts = new Dictionary<long, int>();
-        var edgeValues = new Dictionary<long, Vector2Int>();
-        for (var i = 0; i + 2 < triangles.Length; i += 3)
-        {
-            AddMeshEdge(triangles[i], triangles[i + 1], vertexCount, edgeCounts, edgeValues);
-            AddMeshEdge(triangles[i + 1], triangles[i + 2], vertexCount, edgeCounts, edgeValues);
-            AddMeshEdge(triangles[i + 2], triangles[i], vertexCount, edgeCounts, edgeValues);
-        }
-        return edgeCounts.Where(pair => pair.Value == 1).Select(pair => edgeValues[pair.Key]).ToArray();
-    }
-
-    private static List<Vector2[]> BuildMeshOutlines(Vector2[] vertices, Vector2Int[] edges)
-    {
-        var result = new List<Vector2[]>();
-        if (vertices == null || vertices.Length == 0 || edges == null || edges.Length == 0) return result;
-
-        var neighbors = new Dictionary<int, List<int>>();
-        var remaining = new HashSet<long>();
-        foreach (var edge in edges)
-        {
-            if (edge.x < 0 || edge.y < 0 || edge.x >= vertices.Length || edge.y >= vertices.Length || edge.x == edge.y)
-            {
-                throw new InvalidOperationException("Sprite 网格边界包含无效顶点。");
-            }
-            AddOutlineNeighbor(neighbors, edge.x, edge.y);
-            AddOutlineNeighbor(neighbors, edge.y, edge.x);
-            remaining.Add(GetMeshEdgeKey(edge.x, edge.y));
-        }
-        if (neighbors.Any(pair => pair.Value.Distinct().Count() != 2))
-        {
-            throw new InvalidOperationException("Sprite 网格边界不是可可靠迁移的闭合轮廓。");
-        }
-
-        while (remaining.Count > 0)
-        {
-            var firstKey = remaining.First();
-            var start = (int)(firstKey >> 32);
-            var current = start;
-            var previous = -1;
-            var points = new List<Vector2>();
-            for (var step = 0; step <= edges.Length; step++)
-            {
-                points.Add(vertices[current]);
-                var nextCandidates = neighbors[current].Where(neighbor =>
-                    neighbor != previous && remaining.Contains(GetMeshEdgeKey(current, neighbor))).ToArray();
-                if (nextCandidates.Length == 0)
-                {
-                    throw new InvalidOperationException("Sprite 网格边界无法组成闭合轮廓。");
-                }
-                var next = nextCandidates[0];
-                if (!remaining.Remove(GetMeshEdgeKey(current, next)))
-                {
-                    throw new InvalidOperationException("Sprite 网格边界无法组成闭合轮廓。");
-                }
-                previous = current;
-                current = next;
-                if (current == start) break;
-            }
-            if (current != start || points.Count < 3)
-            {
-                throw new InvalidOperationException("Sprite 网格边界无法组成有效轮廓。");
-            }
-            result.Add(points.ToArray());
-        }
-        return result;
-    }
-
-    private static void AddOutlineNeighbor(Dictionary<int, List<int>> neighbors, int vertex, int neighbor)
-    {
-        List<int> values;
-        if (!neighbors.TryGetValue(vertex, out values))
-        {
-            values = new List<int>();
-            neighbors.Add(vertex, values);
-        }
-        values.Add(neighbor);
-    }
-
-    private static long GetMeshEdgeKey(int first, int second)
-    {
-        var min = Math.Min(first, second);
-        var max = Math.Max(first, second);
-        return ((long)min << 32) | (uint)max;
-    }
-
-    private static bool TryValidateSpriteGeometry(Sprite source, Sprite target, out string error)
-    {
-        error = string.Empty;
-        if (source == null || target == null)
-        {
-            error = "源或目标 Sprite 无法读取";
+            error = string.Format("尺寸不一致（期望 {0}x{1}，实际 {2}x{3}）", expectedWidth, expectedHeight,
+                Mathf.RoundToInt(actual.rect.width), Mathf.RoundToInt(actual.rect.height));
             return false;
         }
-
-        var sourceVertices = source.vertices ?? new Vector2[0];
-        var targetVertices = target.vertices ?? new Vector2[0];
-        if (sourceVertices.Length != targetVertices.Length)
+        if (!Mathf.Approximately(actual.pixelsPerUnit, expected.PixelsPerUnit))
         {
-            error = "网格顶点数量不一致（" + sourceVertices.Length + " -> " + targetVertices.Length + "）";
+            error = "PPU 不一致";
             return false;
         }
-        var sourceVertexKeys = sourceVertices.Select(GeometryPointKey).OrderBy(value => value).ToArray();
-        var targetVertexKeys = targetVertices.Select(GeometryPointKey).OrderBy(value => value).ToArray();
-        if (!sourceVertexKeys.SequenceEqual(targetVertexKeys))
+        if (!Approximately(actual.border, expected.Border))
         {
-            error = "网格顶点位置不一致";
+            error = "Border 不一致";
             return false;
         }
-
-        string[] sourceTriangles;
-        string[] targetTriangles;
-        if (!TryBuildTriangleKeys(source, out sourceTriangles) || !TryBuildTriangleKeys(target, out targetTriangles) ||
-            !sourceTriangles.SequenceEqual(targetTriangles))
+        var expectedPivot = new Vector2(NormalizePivotAxis(expected.Pivot.x), NormalizePivotAxis(expected.Pivot.y));
+        if (!Approximately(GetNormalizedPivot(actual), expectedPivot))
         {
-            error = "网格三角形数据不一致";
+            error = "Pivot 不一致";
             return false;
         }
-
-        var sourcePhysics = GetPhysicsShapeKeys(source);
-        var targetPhysics = GetPhysicsShapeKeys(target);
-        if (!sourcePhysics.SequenceEqual(targetPhysics))
+        if (actual.texture.filterMode != expected.FilterMode || actual.texture.wrapMode != expected.WrapMode ||
+            actual.texture.anisoLevel != expected.AnisoLevel)
         {
-            error = "PhysicsShape 数据不一致";
+            error = "Filter/Wrap/Aniso 参数不一致";
+            return false;
+        }
+        var textureSettings = new TextureImporterSettings();
+        importer.ReadTextureSettings(textureSettings);
+        if (importer.textureType != TextureImporterType.Sprite || importer.spriteImportMode != SpriteImportMode.Single ||
+            textureSettings.spriteMeshType != SpriteMeshType.FullRect)
+        {
+            error = "导入类型不是 Single Sprite / Full Rect";
+            return false;
+        }
+        if (!string.Equals(importer.assetBundleName, expected.AssetBundleName, StringComparison.Ordinal) ||
+            !string.Equals(importer.assetBundleVariant, expected.AssetBundleVariant, StringComparison.Ordinal))
+        {
+            error = "AssetBundle 名称或变体不一致";
             return false;
         }
         return true;
-    }
-
-    private static bool TryBuildTriangleKeys(Sprite sprite, out string[] keys)
-    {
-        var vertices = sprite.vertices ?? new Vector2[0];
-        var triangles = sprite.triangles ?? new ushort[0];
-        if (triangles.Length % 3 != 0)
-        {
-            keys = new string[0];
-            return false;
-        }
-        var result = new List<string>();
-        for (var i = 0; i < triangles.Length; i += 3)
-        {
-            var first = triangles[i];
-            var second = triangles[i + 1];
-            var third = triangles[i + 2];
-            if (first < 0 || second < 0 || third < 0 ||
-                first >= vertices.Length || second >= vertices.Length || third >= vertices.Length)
-            {
-                keys = new string[0];
-                return false;
-            }
-            var points = new[]
-            {
-                GeometryPointKey(vertices[first]),
-                GeometryPointKey(vertices[second]),
-                GeometryPointKey(vertices[third])
-            };
-            Array.Sort(points, StringComparer.Ordinal);
-            result.Add(string.Join("|", points));
-        }
-        keys = result.OrderBy(value => value, StringComparer.Ordinal).ToArray();
-        return true;
-    }
-
-    private static string[] GetPhysicsShapeKeys(Sprite sprite)
-    {
-        var shapes = new List<string>();
-        for (var shapeIndex = 0; shapeIndex < sprite.GetPhysicsShapeCount(); shapeIndex++)
-        {
-            var points = new List<Vector2>();
-            sprite.GetPhysicsShape(shapeIndex, points);
-            shapes.Add(string.Join("|", points.Select(GeometryPointKey).OrderBy(value => value, StringComparer.Ordinal).ToArray()));
-        }
-        return shapes.OrderBy(value => value, StringComparer.Ordinal).ToArray();
-    }
-
-    private static string GeometryPointKey(Vector2 point)
-    {
-        return Mathf.RoundToInt(point.x * 10000f) + "," + Mathf.RoundToInt(point.y * 10000f);
-    }
-
-    private static void AddMeshEdge(
-        int first,
-        int second,
-        int vertexCount,
-        Dictionary<long, int> edgeCounts,
-        Dictionary<long, Vector2Int> edgeValues)
-    {
-        if (first < 0 || second < 0 || first >= vertexCount || second >= vertexCount || first == second) return;
-        var key = GetMeshEdgeKey(first, second);
-        var min = Math.Min(first, second);
-        var max = Math.Max(first, second);
-        int count;
-        edgeCounts.TryGetValue(key, out count);
-        edgeCounts[key] = count + 1;
-        if (!edgeValues.ContainsKey(key)) edgeValues[key] = new Vector2Int(min, max);
     }
 
     private static bool TryEnsureFindReference2Ready(out string error)
@@ -1879,15 +1461,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
     }
 
-    private static int CountSerializedGuidReferences(string guid, string excludedPath)
+    private static int CountGuidReferencesInPaths(string guid, IEnumerable<string> assetPaths)
     {
         if (string.IsNullOrEmpty(guid)) return 0;
         var count = 0;
-        foreach (var absolutePath in EnumerateAssetTextFiles())
+        foreach (var assetPath in assetPaths.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var path = AbsoluteToAssetPath(absolutePath);
-            if (string.Equals(path, excludedPath, StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
+            var absolutePath = AssetPathToAbsolute(assetPath);
+            if (!IsUnitySerializedTextFile(absolutePath)) continue;
             string content;
             try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
             count += SerializedGuidRegex.Matches(content).Cast<Match>()
@@ -1982,7 +1563,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         string targetGuid,
         long targetLocalId,
         string sourceAssetPath,
-        string backupRoot)
+        string backupRoot,
+        IEnumerable<string> referenceAssetPaths)
     {
         var result = new List<ReferenceEdit>();
         var pattern = new Regex(
@@ -1990,9 +1572,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             RegexOptions.CultureInvariant);
         var replacement = "{fileID: " + targetLocalId + ", guid: " + targetGuid + ", type: 3}";
 
-        foreach (var absolutePath in EnumerateAssetTextFiles())
+        foreach (var assetPath in referenceAssetPaths.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var assetPath = AbsoluteToAssetPath(absolutePath);
             if (string.Equals(assetPath, sourceAssetPath, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
@@ -2001,6 +1582,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             {
                 continue;
             }
+            var absolutePath = AssetPathToAbsolute(assetPath);
+            if (!IsUnitySerializedTextFile(absolutePath)) continue;
 
             string content;
             try
@@ -2017,6 +1600,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
                 continue;
             }
 
+            var replacementCount = pattern.Matches(content).Count;
+
             var backupPath = Path.Combine(
                 backupRoot,
                 "ReferenceEdits",
@@ -2028,7 +1613,8 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             {
                 AbsolutePath = absolutePath,
                 BackupPath = backupPath,
-                UpdatedContent = pattern.Replace(content, replacement)
+                UpdatedContent = pattern.Replace(content, replacement),
+                ReplacementCount = replacementCount
             });
         }
 
@@ -2037,84 +1623,30 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
 
     private void BuildAtlasGroups()
     {
-        atlases.Clear();
-        foreach (var group in candidates.Where(candidate => !candidate.ReuseExistingPng)
+        var existing = atlases.ToDictionary(
+            atlas => atlas.SourceTexturePath,
+            atlas => atlas,
+            StringComparer.OrdinalIgnoreCase);
+        var rebuilt = new List<AtlasInfo>();
+        foreach (var group in candidates.Where(candidate => !candidate.ReuseExistingPng && !candidate.Blocked)
                      .GroupBy(c => c.SourceTexturePath, StringComparer.OrdinalIgnoreCase))
         {
-            atlases.Add(new AtlasInfo
+            AtlasInfo atlas;
+            if (!existing.TryGetValue(group.Key, out atlas))
             {
-                SourceTexturePath = group.Key,
-                SourceTextureGuid = group.First().SourceTextureGuid,
-                CandidateCount = group.Count()
-            });
+                atlas = new AtlasInfo();
+            }
+            atlas.SourceTexturePath = group.Key;
+            atlas.SourceTextureGuid = group.First().SourceTextureGuid;
+            atlas.CandidateCount = group.Count();
+            rebuilt.Add(atlas);
         }
+        atlases.Clear();
+        atlases.AddRange(rebuilt);
         atlases.Sort((a, b) => string.Compare(a.SourceTexturePath, b.SourceTexturePath, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static int RepairExistingConvertedReferences(string backupRoot)
-    {
-        var repaired = 0;
-        foreach (var absolutePath in Directory.GetFiles(Application.dataPath, "*.png", SearchOption.AllDirectories))
-        {
-            var metaPath = absolutePath + ".meta";
-            if (!File.Exists(metaPath)) continue;
-            string guid;
-            try { guid = ReadMetaGuid(metaPath); } catch (Exception) { continue; }
-            if (string.IsNullOrEmpty(guid)) continue;
-            var assetPath = AbsoluteToAssetPath(absolutePath);
-            var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
-            if (sprite == null) continue;
-            long localId;
-            string actualGuid;
-            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out actualGuid, out localId) || localId != SpriteLocalId) continue;
-            var edits = PrepareReferenceEdits(guid, localId, guid, SpriteLocalId, assetPath, backupRoot);
-            foreach (var edit in edits)
-            {
-                File.WriteAllText(edit.AbsolutePath, edit.UpdatedContent, new UTF8Encoding(false));
-                repaired++;
-            }
-        }
-        return repaired;
-    }
-
-    private static int CountExistingReferenceRepairs()
-    {
-        var count = 0;
-        foreach (var absolutePath in Directory.GetFiles(Application.dataPath, "*.png", SearchOption.AllDirectories))
-        {
-            var metaPath = absolutePath + ".meta";
-            if (!File.Exists(metaPath)) continue;
-            string guid;
-            try { guid = ReadMetaGuid(metaPath); } catch (Exception) { continue; }
-            if (string.IsNullOrEmpty(guid)) continue;
-            var assetPath = AbsoluteToAssetPath(absolutePath);
-            var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
-            if (sprite == null) continue;
-            long localId;
-            string actualGuid;
-            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(sprite, out actualGuid, out localId)) continue;
-            count += CountType2References(guid, localId, assetPath);
-        }
-        return count;
-    }
-
-    private static int CountType2References(string guid, long localId, string excludedPath)
-    {
-        var pattern = new Regex("\\{fileID:\\s*" + localId + ",\\s*guid:\\s*" + Regex.Escape(guid) + ",\\s*type:\\s*2\\s*\\}", RegexOptions.Compiled);
-        var count = 0;
-        foreach (var absolutePath in EnumerateAssetTextFiles())
-        {
-            var path = AbsoluteToAssetPath(absolutePath);
-            if (string.Equals(path, excludedPath, StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
-            string content;
-            try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
-            count += pattern.Matches(content).Count;
-        }
-        return count;
-    }
-
-    private static void DeleteUnusedAtlases(
+    private void DeleteUnusedAtlases(
         string backupRoot,
         List<string> successes,
         IEnumerable<ConversionCandidate> pending,
@@ -2133,14 +1665,18 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         var safe = new List<AtlasUsage>();
         foreach (var sourcePath in sourcePaths)
         {
-            var usage = AnalyzeAtlasUsage(sourcePath);
+            var atlas = atlases.FirstOrDefault(item =>
+                string.Equals(item.SourceTexturePath, sourcePath, StringComparison.OrdinalIgnoreCase));
+            var usage = AnalyzeAtlasUsage(sourcePath, atlas);
             if (usage.CanDelete) safe.Add(usage);
             else kept.Add(sourcePath + "（" + string.Join("；", usage.Blockers.Take(4).ToArray()) + "）");
         }
         if (safe.Count == 0) return;
 
         var message = "以下图集当前未发现有效引用，删除前会备份：\n\n" +
-                      string.Join("\n", safe.Select(a => a.Path).ToArray()) + "\n\n是否删除？";
+                      string.Join("\n", safe.Select(a => a.Path +
+                          (a.Notes.Count == 0 ? string.Empty : "（" + string.Join("；", a.Notes.ToArray()) + "）")).ToArray()) +
+                      "\n\n是否删除？";
         if (!EditorUtility.DisplayDialog("二次确认：删除未引用图集", message, "删除图集", "保留"))
         {
             kept.AddRange(safe.Select(a => a.Path + "（用户选择保留）"));
@@ -2168,7 +1704,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
     }
 
-    private static AtlasUsage AnalyzeAtlasUsage(string sourcePath)
+    private static AtlasUsage AnalyzeAtlasUsage(string sourcePath, AtlasInfo atlas)
     {
         var usage = new AtlasUsage { Path = sourcePath, Guid = AssetDatabase.AssetPathToGUID(sourcePath) };
         if (string.IsNullOrEmpty(usage.Guid))
@@ -2177,45 +1713,36 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             return usage;
         }
         string fr2Error;
-        if (!TryEnsureFindReference2Ready(out fr2Error))
+
+        if (atlas == null)
         {
-            usage.Blockers.Add("依赖 FindReference2 缓存：" + fr2Error);
+            usage.Blockers.Add("缺少预检阶段的图集引用快照");
+            return usage;
         }
 
-        foreach (var absolutePath in EnumerateAssetTextFiles())
+        foreach (var path in atlas.GuidReferencePaths)
         {
-            var path = AbsoluteToAssetPath(absolutePath);
             if (string.Equals(path, sourcePath, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(path, sourcePath + ".meta", StringComparison.OrdinalIgnoreCase) ||
                 path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
+            var absolutePath = AssetPathToAbsolute(path);
+            if (!IsUnitySerializedTextFile(absolutePath)) continue;
             string content;
             try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
             if (ContainsGuidReference(content, usage.Guid)) usage.Blockers.Add(path + "（GUID 引用）");
         }
 
-        foreach (var absolutePath in EnumerateTextFiles())
+        foreach (var path in atlas.RuntimeStringReferencePaths)
         {
-            var path = AbsoluteToAssetPath(absolutePath);
-            if (path.EndsWith(".meta", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(path, sourcePath, StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
+            var absolutePath = AssetPathToAbsolute(path);
+            if (!File.Exists(absolutePath)) continue;
             string content;
             try { content = File.ReadAllText(absolutePath); } catch (Exception) { continue; }
-            if (content.IndexOf(sourcePath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+            if (content.IndexOf(usage.Guid, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                content.IndexOf(sourcePath, StringComparison.OrdinalIgnoreCase) >= 0 ||
                 content.IndexOf(sourcePath.Replace('/', '\\'), StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 usage.Blockers.Add(path + "（字符串路径引用）");
-            }
-        }
-
-        foreach (var absolutePath in Directory.GetFiles(Application.dataPath, "*.asset", SearchOption.AllDirectories))
-        {
-            var path = AbsoluteToAssetPath(absolutePath);
-            var sprite = AssetDatabase.LoadMainAssetAtPath(path) as Sprite;
-            if (sprite == null || sprite.texture == null) continue;
-            if (string.Equals(AssetDatabase.GetAssetPath(sprite.texture), sourcePath, StringComparison.OrdinalIgnoreCase))
-            {
-                usage.Blockers.Add(path + "（仍有 Sprite .asset）");
             }
         }
 
@@ -2226,12 +1753,14 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             {
                 if (string.Equals(pluginPath, sourcePath, StringComparison.OrdinalIgnoreCase) ||
                     pluginPath.EndsWith("FR2_Cache.asset", StringComparison.OrdinalIgnoreCase)) continue;
+                if (pluginPath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) &&
+                    !File.Exists(AssetPathToAbsolute(pluginPath))) continue;
                 usage.Blockers.Add(pluginPath + "（FindReference2）");
             }
         }
         else
         {
-            usage.Blockers.Add("FindReference2 引用查询失败：" + fr2Error);
+            usage.Notes.Add("FindReference2 未交叉检查：" + fr2Error);
         }
         usage.Blockers = usage.Blockers.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         usage.CanDelete = usage.Blockers.Count == 0;
@@ -2244,38 +1773,10 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             .Any(match => string.Equals(match.Groups[1].Value, guid, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string GetOutputPath(string assetPath, string guid, out bool alreadyConverted)
+    private static string GetOutputPath(string assetPath)
     {
         var desired = Path.ChangeExtension(assetPath, ".png").Replace('\\', '/');
-        alreadyConverted = false;
-        var desiredAbsolute = AssetPathToAbsolute(desired);
-        if (!File.Exists(desiredAbsolute) && !File.Exists(desiredAbsolute + ".meta"))
-        {
-            return desired;
-        }
-
-        string existingGuid = string.Empty;
-        if (File.Exists(desiredAbsolute + ".meta"))
-        {
-            try { existingGuid = ReadMetaGuid(desiredAbsolute + ".meta"); } catch (Exception) { }
-        }
-        if (string.Equals(existingGuid, guid, StringComparison.OrdinalIgnoreCase) &&
-            AssetDatabase.LoadAssetAtPath<Sprite>(desired) != null)
-        {
-            alreadyConverted = true;
-            return desired;
-        }
-
-        var directory = Path.GetDirectoryName(assetPath).Replace('\\', '/');
-        var conflictDirectory = directory + "/ConvertedPng";
-        var baseName = Path.GetFileNameWithoutExtension(assetPath) + ".png";
-        return AssetDatabase.GenerateUniqueAssetPath(conflictDirectory + "/" + baseName);
-    }
-
-    private static string CreateTemporaryImportPath()
-    {
-        Directory.CreateDirectory(AssetPathToAbsolute(TemporaryImportFolder));
-        return TemporaryImportFolder + "/SpriteAssetToPngTemp_" + Guid.NewGuid().ToString("N") + ".png";
+        return desired;
     }
 
     private static string ReadMetaGuid(string metaPath)
@@ -2283,14 +1784,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         var content = File.ReadAllText(metaPath);
         var match = GuidLineRegex.Match(content);
         return match.Success ? match.Value.Substring(match.Value.IndexOf(':') + 1).Trim() : string.Empty;
-    }
-
-    private static IEnumerable<string> EnumerateAssetTextFiles()
-    {
-        foreach (var path in Directory.GetFiles(Application.dataPath, "*", SearchOption.AllDirectories))
-        {
-            if (IsUnitySerializedTextFile(path)) yield return path;
-        }
     }
 
     private static bool IsUnitySerializedTextAsset(string assetPath)
@@ -2324,12 +1817,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         }
     }
 
-    private static IEnumerable<string> EnumerateTextFiles()
-    {
-        return Directory.GetFiles(Application.dataPath, "*", SearchOption.AllDirectories)
-            .Where(path => TextExtensions.Contains(Path.GetExtension(path)));
-    }
-
     private static void DeleteFileIfExists(string path)
     {
         if (File.Exists(path)) File.Delete(path);
@@ -2360,9 +1847,15 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         scanProblems.Clear();
         specialAssetReports.Clear();
         scannedAssetCount = 0;
-        pivotNormalizationCount = 0;
         layoutApproximationCount = 0;
-        existingReferenceRepairCount = 0;
+        scanPaths = new string[0];
+        scanIndex = 0;
+        referenceScanPaths = new string[0];
+        referenceScanIndex = 0;
+        referenceFinalizeIndex = 0;
+        referenceScanPrepared = false;
+        scanCandidatesByGuid.Clear();
+        scanAtlasesByGuid.Clear();
         hasScanned = false;
     }
 
@@ -2470,6 +1963,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
     {
         public readonly List<string> Notes = new List<string>();
         public readonly List<string> Warnings = new List<string>();
+        public readonly List<string> SettingDifferences = new List<string>();
         public string AssetPath;
         public string Guid;
         public long LocalId;
@@ -2479,10 +1973,20 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public Vector2 NormalizedPivot;
         public bool ApproximatePivot;
         public bool HasOffset;
-        public bool AlreadyConverted;
         public bool Packed;
         public bool ReuseExistingPng;
+        public bool OverwriteExistingPng;
         public string ExistingPngGuid;
+        public string ActionLabel;
+        public int SerializedReferenceCount;
+        public int AllGuidReferenceCount;
+        public int MigratableReferenceCount;
+        public readonly HashSet<string> AllGuidReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> SerializedReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> RuntimeStringReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public bool Blocked;
     }
 
@@ -2497,6 +2001,10 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public string SourceTexturePath;
         public string SourceTextureGuid;
         public int CandidateCount;
+        public readonly HashSet<string> GuidReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> RuntimeStringReferencePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     }
 
     private sealed class AtlasUsage
@@ -2505,6 +2013,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public string Guid;
         public bool CanDelete;
         public List<string> Blockers = new List<string>();
+        public List<string> Notes = new List<string>();
     }
 
     private sealed class ConversionRun
@@ -2517,9 +2026,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public List<string> KeptAtlases;
         public int Index;
         public bool Refreshed;
-        public bool Repaired;
         public bool AtlasChecked;
-        public int RepairedReferences;
         public int ReusedPng;
     }
 
@@ -2560,6 +2067,7 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
             var textureSettings = new TextureImporterSettings();
             importer.ReadTextureSettings(textureSettings);
             textureSettings.spriteAlignment = (int)SpriteAlignment.Custom;
+            textureSettings.spriteMeshType = SpriteMeshType.FullRect;
             textureSettings.spritePivot = new Vector2(
                 NormalizePivotAxis(Pivot.x),
                 NormalizePivotAxis(Pivot.y));
@@ -2580,5 +2088,6 @@ public sealed class SpriteAssetToPngWindow : EditorWindow
         public string AbsolutePath;
         public string BackupPath;
         public string UpdatedContent;
+        public int ReplacementCount;
     }
 }
